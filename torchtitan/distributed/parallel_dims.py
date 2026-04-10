@@ -76,6 +76,15 @@ class ParallelDims:
         if ep > 1:
             assert etp == tp or etp == 1, "Currently we only support ETP=TP or ETP=1"
 
+        fsdp = dp_shard * cp
+        max_ep = max((fsdp * tp) // etp, 1)
+        if ep > max_ep:
+            logger.warning(
+                f"Requested expert_parallel_degree ({ep}) is larger than maximum supported "
+                f"by FSDP and TP degrees (max_ep={max_ep}). Clamping ep to {max_ep}."
+            )
+            self.ep = ep = max_ep
+
     def _mesh_exist(self, name: str, degree: int) -> bool:
         if name == "efsdp":
             # We always keep the efsdp if EP is larger than 1 because we need
@@ -128,22 +137,10 @@ class ParallelDims:
             dim_names: tuple[str, ...],
             dim_degrees: tuple[int, ...],
         ):
-            """Unflatten the world mesh to create the required mesh dimensions.
-
-            Uses fake backend for dimensions with degree 1 or for 'batch' dimension
-            to avoid unnecessary process group creation.
-            """
-            backend_override = {}
-            for name, degree in zip(dim_names, dim_degrees, strict=True):
-                if not self._mesh_exist(name, degree):
-                    backend_override[name] = "fake"
-
-            return world_mesh._unflatten(
-                0,
+            return init_device_mesh(
+                world_mesh.device_type,
                 dim_degrees,
-                dim_names,
-                # pyrefly: ignore [bad-argument-type]
-                backend_override=backend_override,
+                mesh_dim_names=dim_names,
             )
 
         logger.info(

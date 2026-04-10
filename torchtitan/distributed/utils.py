@@ -419,12 +419,16 @@ def init_distributed(
         dist_config.use_torchcomms = True
         device_id = torch.device(device_type, int(os.environ["LOCAL_RANK"]))
 
-    torch.distributed.init_process_group(
-        backend=_get_distributed_backend(enable_cpu_backend),
-        timeout=timedelta(seconds=comm_config.init_timeout_seconds),
-        _ranks=ranks if ranks is not None else [],
-        device_id=device_id,
-    )
+    init_kwargs = {
+        "backend": _get_distributed_backend(enable_cpu_backend),
+        "timeout": timedelta(seconds=comm_config.init_timeout_seconds),
+        "device_id": device_id,
+    }
+    # PyTorch 2.8+ removed the undocumented `_ranks` parameter from init_process_group.
+    # Only pass it if strictly necessary for backward compatibility.
+    if ranks:
+        init_kwargs["_ranks"] = ranks
+    torch.distributed.init_process_group(**init_kwargs)
 
     return torch.distributed.get_world_size()
 
@@ -448,7 +452,10 @@ def set_pg_timeouts(
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
     # under the old/slow timeout.
-    torch.distributed.barrier(device_ids=[device_module.current_device()])
+    if hasattr(device_module, "current_device"):
+        torch.distributed.barrier(device_ids=[device_module.current_device()])
+    else:
+        torch.distributed.barrier()
     device_module.synchronize()
 
     # None represents the 'default' PG, not part of the mesh

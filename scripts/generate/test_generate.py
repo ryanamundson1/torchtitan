@@ -98,7 +98,8 @@ def test_generate(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"{device_type}:{local_rank}")
-    device_module.set_device(device)
+    if hasattr(device_module, "set_device"):
+        device_module.set_device(device)
     device_memory_monitor = build_device_memory_monitor()
 
     logger.info(f"World Size: {world_size}, Local Rank: {local_rank} on {device}")

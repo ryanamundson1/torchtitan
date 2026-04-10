@@ -18,9 +18,12 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
     PipelineScheduleMulti,
     PipelineScheduleSingle,
-    ScheduleDualPipeV,
     ScheduleZBVZeroBubble,
 )
+try:
+    from torch.distributed.pipelining.schedules import ScheduleDualPipeV
+except ImportError:
+    ScheduleDualPipeV = None
 
 from torchtitan.components.loss import LossFunction
 from torchtitan.config import (

@@ -206,7 +206,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # pyrefly: ignore [read-only]
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
-        device_module.set_device(self.device)
+        if hasattr(device_module, "set_device"):
+            device_module.set_device(self.device)
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
@@ -766,7 +767,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
             self.config.training.max_norm,
-            foreach=True,
+            foreach=None,
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )

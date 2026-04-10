@@ -23,19 +23,30 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
-from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-    consolidate_safetensors_files_on_every_rank,
-)
-from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+try:
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files_on_every_rank,
+    )
+except ImportError:
+    consolidate_safetensors_files_on_every_rank = None
+try:
+    from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+except ImportError:
+    DefaultStager = None
+    StagingOptions = None
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
     StateDictOptions,
 )
-from torch.distributed.checkpoint.state_dict_saver import (
-    AsyncCheckpointerType,
-    AsyncSaveResponse,
-)
+try:
+    from torch.distributed.checkpoint.state_dict_saver import (
+        AsyncCheckpointerType,
+        AsyncSaveResponse,
+    )
+except ImportError:
+    AsyncCheckpointerType = None
+    AsyncSaveResponse = None
 from torch.distributed.checkpoint.stateful import Stateful
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -499,12 +510,15 @@ class CheckpointManager(Configurable):
             )
 
         if to_hf and fqn_to_index_mapping:
-            consolidate_safetensors_files_on_every_rank(
-                input_dir=os.path.join(checkpoint_id, "sharded"),
-                output_dir=checkpoint_id,
-                fqn_to_index_mapping=fqn_to_index_mapping,
-                num_threads=5,
-            )
+            if consolidate_safetensors_files_on_every_rank is not None:
+                consolidate_safetensors_files_on_every_rank(
+                    input_dir=os.path.join(checkpoint_id, "sharded"),
+                    output_dir=checkpoint_id,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    num_threads=5,
+                )
+            else:
+                logger.warning("Skipping HF safetensors consolidation: function missing in this PyTorch version.")
 
         if enable_garbage_collection:
             GarbageCollection.collect("GC collection invoked by checkpointer.")

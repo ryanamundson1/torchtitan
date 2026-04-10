@@ -10,13 +10,20 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
-    _ContextParallel,
-    _enable_context_parallel_dispatcher,
-    _HeadTailLoadBalancer,
-    _PTRRLoadBalancer,
-)
+try:
+    from torch.distributed.tensor.experimental._attention import (
+        _context_parallel_shard,
+        _ContextParallel,
+        _enable_context_parallel_dispatcher,
+        _HeadTailLoadBalancer,
+        _PTRRLoadBalancer,
+    )
+except ImportError:
+    _context_parallel_shard = None
+    _ContextParallel = None
+    _enable_context_parallel_dispatcher = None
+    _HeadTailLoadBalancer = None
+    _PTRRLoadBalancer = None
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.attention.flex_attention import BlockMask
 

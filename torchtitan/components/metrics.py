@@ -40,15 +40,22 @@ class DeviceMemoryMonitor:
     def __init__(self, device: str = f"{device_type}:0"):
         # pyrefly: ignore [read-only]
         self.device = torch.device(device)  # device object
-        self.device_name = device_module.get_device_name(self.device)
-        self.device_index = device_module.current_device()
-        self.device_capacity = device_module.get_device_properties(
-            self.device
-        ).total_memory
+        self.device_name = (
+            device_module.get_device_name(self.device)
+            if hasattr(device_module, "get_device_name")
+            else f"{device_type.upper()} Device"
+        )
+        self.device_index = device_module.current_device() if hasattr(device_module, "current_device") else 0
+        if hasattr(device_module, "get_device_properties"):
+            self.device_capacity = device_module.get_device_properties(self.device).total_memory
+        else:
+            self.device_capacity = 0
         self.device_capacity_gib = self._to_gib(self.device_capacity)
 
-        device_module.reset_peak_memory_stats()
-        device_module.empty_cache()
+        if hasattr(device_module, "reset_peak_memory_stats"):
+            device_module.reset_peak_memory_stats()
+        if hasattr(device_module, "empty_cache"):
+            device_module.empty_cache()
 
     def _to_gib(self, memory_in_bytes):
         # NOTE: GiB (gibibyte) is 1024, vs GB is 1000
@@ -57,10 +64,12 @@ class DeviceMemoryMonitor:
         return memory_in_gib
 
     def _to_pct(self, memory):
+        if self.device_capacity == 0:
+            return 0.0
         return 100 * memory / self.device_capacity
 
     def get_peak_stats(self):
-        device_info = device_module.memory_stats(self.device)
+        device_info = device_module.memory_stats(self.device) if hasattr(device_module, "memory_stats") else {}
 
         max_active = device_info.get("active_bytes.all.peak", -1)
         max_active_gib = self._to_gib(max_active)
@@ -90,7 +99,8 @@ class DeviceMemoryMonitor:
         )
 
     def reset_peak_stats(self):
-        device_module.reset_peak_memory_stats()
+        if hasattr(device_module, "reset_peak_memory_stats"):
+            device_module.reset_peak_memory_stats()
 
 
 def build_device_memory_monitor():

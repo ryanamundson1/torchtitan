@@ -39,7 +39,8 @@ def get_device_info() -> tuple[str, ModuleType]:
 
 
 device_type, device_module = get_device_info()
-
+if device_type == "mps" and not hasattr(device_module, "is_initialized"):
+    device_module.is_initialized = lambda: True
 
 # used to avoid stragglers in garbage collection
 class GarbageCollection:

@@ -19,21 +19,33 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental import local_map
 from torch.nn.attention import (
-    activate_flash_attention_impl,
-    current_flash_attention_impl,
     sdpa_kernel,
     SDPBackend,
 )
+try:
+    from torch.nn.attention import (
+        activate_flash_attention_impl,
+        current_flash_attention_impl,
+    )
+except ImportError:
+    activate_flash_attention_impl = None
+    current_flash_attention_impl = None
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
     _mask_mod_signature,
     _score_mod_signature,
-    AuxRequest,
     BlockMask,
     create_block_mask,
     flex_attention,
 )
-from torch.nn.attention.varlen import varlen_attn
+try:
+    from torch.nn.attention.flex_attention import AuxRequest
+except ImportError:
+    AuxRequest = None
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:
+    varlen_attn = None
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 
@@ -267,9 +279,7 @@ class FlexAttention(LocalMapInnerAttention):
         kernel_options: dict = field(default_factory=dict)
 
     inductor_configs: ClassVar[dict[str, bool]] = {
-        # TODO: turn on wrap_inductor_compiled_regions after PyTorch fix is
-        # landed again: https://github.com/pytorch/pytorch/pull/175733.
-        "wrap_inductor_compiled_regions": False,
+        # "wrap_inductor_compiled_regions" removed in 2.8.0
         "max_autotune": True,
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
@@ -318,7 +328,7 @@ class FlexAttention(LocalMapInnerAttention):
             block_mask=attention_masks,
             scale=scale,
             enable_gqa=enable_gqa,
-            return_aux=AuxRequest(lse=return_lse),
+            return_aux=AuxRequest(lse=return_lse) if AuxRequest is not None else None,
             kernel_options=self.kernel_options,
         )
         # Transpose back to (bs, seq, heads, dim)

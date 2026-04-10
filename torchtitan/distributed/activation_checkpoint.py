@@ -159,8 +159,6 @@ def _apply_op_sac(
         context_fn=lambda: create_selective_checkpoint_contexts(_get_custom_policy()),
         preserve_rng_state=ac_config.preserve_rng_state,
         determinism_check=ac_config.determinism_check,
-        early_stop=ac_config.early_stop,
-        debug=ac_config.debug,
     )
 
 
@@ -178,8 +176,6 @@ def _apply_full_ac(module: nn.Module, ac_config: ACConfig) -> nn.Module:
         module,
         preserve_rng_state=ac_config.preserve_rng_state,
         determinism_check=ac_config.determinism_check,
-        early_stop=ac_config.early_stop,
-        debug=ac_config.debug,
     )
 
 
@@ -229,7 +225,8 @@ def apply_ac(
     #
     # Also see: https://github.com/pytorch/pytorch/issues/166926
     # pyrefly: ignore [missing-attribute]
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
+    if hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
 
     if ac_config.mode == "memory_budget":
         assert model_compile_enabled, "Memory budget mode requires model to be compiled"
