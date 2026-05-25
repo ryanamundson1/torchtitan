@@ -38,10 +38,14 @@ def generate_next_token(
     top_k: int | None = None,
     rng: torch.Generator | None = None,
 ) -> torch.Tensor:
-    logits = model(x)  # (B, T, vocab_size)
-    probs = logits_to_probs(logits[:, -1, :], temperature, top_k)
+    output = model(x)  # (B, T, vocab_size) or ((B, T, vocab_size), moral_loss)
+    # Handle models that return (logits, aux_loss) tuples (e.g., EleosModel)
+    if isinstance(output, tuple):
+        output = output[0]
+    probs = logits_to_probs(output[:, -1, :], temperature, top_k)
     next_token = multinomial_sample_one(probs, rng=rng)
     return next_token
+
 
 
 @torch.no_grad()

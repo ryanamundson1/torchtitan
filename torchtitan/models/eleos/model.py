@@ -10,7 +10,7 @@ Eleos Model Architecture
 
 Eleos (Greek: ἔλεος, "mercy / compassion") is a novel LLM architecture
 built on top of DeepSeek V3's Multi-Latent Attention (MLA).  It introduces
-three integral architectural components:
+four integral architectural components:
 
 1. **DualHemisphereAttention** — Splits the MLA head pool into a *logical*
    sub-stream (structured reasoning, deductive inference) and a *generative*
@@ -19,7 +19,25 @@ three integral architectural components:
    split ratio is **configurable per layer** so early layers can favour
    logical processing while later layers favour generative synthesis.
 
-2. **MoralGovernor** — A differentiable module embedded inside every
+2. **CorpusCallosum** — A biologically-inspired cross-hemisphere communication
+   module that can be selectively enabled at specific transformer layers.  It
+   models the three key properties of the biological corpus callosum:
+
+   - **Topographic selectivity**: Only certain layers carry a callosal
+     connection (genu = early/planning, midbody = middle/integration,
+     isthmus = mid-late/temporal, splenium = final/perceptual synthesis).
+   - **Excitatory + inhibitory duality**: Callosal axons are glutamatergic
+     but frequently synapse onto GABAergic interneurons in the target
+     hemisphere, producing net *Interhemispheric Inhibition* (IHI).  We model
+     both directions:  logical → generative (excitatory) and
+     generative → logical (inhibitory / IHI).
+   - **Learned dynamic gate**: A small MLP produces a gate g ∈ [0, 1] from
+     the current hidden state, modelling the task-dependent switch between
+     *integrated* (high g) and *segregated* (low g) processing modes.
+   - **Fiber rank**: Thinner low-rank projections at genu/splenium (slow
+     associative fibers); thicker higher-rank at midbody (fast sensorimotor).
+
+3. **MoralGovernor** — A differentiable module embedded inside every
    transformer block.  It:
    - Computes a scalar *moral score* in [0, 1] from the hidden state.
    - Computes a continuous *blend gate* (α ∈ [0, 1]) that weights how much
@@ -28,7 +46,7 @@ three integral architectural components:
      manipulative / harmful input patterns and amplifies the moral tone of
      responses when such intent is detected.
 
-3. **Moral Auxiliary Loss** — During training a secondary loss term
+4. **Moral Auxiliary Loss** — During training a secondary loss term
    ``-mean(moral_scores) * moral_loss_weight`` encourages the model to
    develop internal representations that score highly on morality.  This is
    analogous to—and implemented in the same manner as—the MoE load-balance
@@ -191,6 +209,109 @@ class MoralGovernor(Module):
 
 
 # ---------------------------------------------------------------------------
+# CorpusCallosum
+# ---------------------------------------------------------------------------
+
+class CorpusCallosum(Module):
+    """Biologically-inspired cross-hemisphere communication module.
+
+    Models the three key properties of the biological corpus callosum:
+
+    **Excitatory path** (logical → generative):
+        A low-rank bottleneck projection carries signal from the logical
+        hemisphere output to the generative hemisphere.  This simulates
+        glutamatergic callosal axons exciting contralateral pyramidal neurons.
+
+    **Inhibitory path** (generative → logical, i.e. IHI):
+        A separate low-rank projection carries signal from the generative
+        hemisphere back to the logical hemisphere, but the result is negated
+        before addition.  This models the dominant biological observation that
+        callosal fibers frequently synapse onto GABAergic interneurons,
+        producing net *Interhemispheric Inhibition* (IHI).
+
+    **Learned dynamic gate**:
+        A lightweight MLP takes the pre-norm hidden state ``x`` and produces
+        a scalar gate ``g ∈ [0, 1]`` that scales both paths.  This
+        corresponds to the brain's ability to switch between *integrated*
+        (g ≈ 1, hemispheres share information) and *segregated* (g ≈ 0,
+        hemispheres work independently) processing modes.
+
+    The update equations are::
+
+        g = sigmoid(gate_mlp(x))                     # (B, S, 1)
+        cal_excit = g * W_excit_up(relu(W_excit_dn(logical_out)))
+        cal_inhibit = g * W_inhib_up(relu(W_inhib_dn(gen_out)))
+
+        gen_out'     = gen_out     + cal_excit          # excitatory
+        logical_out' = logical_out - cal_inhibit        # IHI (net inhibitory)
+
+    Args:
+        dim:        Hidden dimension of the model.
+        fiber_rank: Bottleneck dimension of the cross-hemisphere projections.
+                    Smaller = thinner fibers (genu/splenium, slower/associative).
+                    Larger  = thicker fibers (midbody, faster/sensorimotor).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        fiber_rank: int
+        gate_hidden: int | None = None
+        """Hidden size of the gate MLP (dim → gate_hidden → 1).
+        Defaults to max(16, dim // 8) if None.
+        Thinner gate = faster inference, larger gate = more expressive gating.
+        """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        dim = config.dim
+        r = config.fiber_rank
+        gate_hidden = config.gate_hidden or max(16, dim // 8)
+
+        # Excitatory path: logical → generative (low-rank bottleneck)
+        self.excit_dn = TTLinear(dim, r, bias=False)
+        self.excit_up = TTLinear(r, dim, bias=False)
+
+        # Inhibitory path: generative → logical (IHI, low-rank bottleneck)
+        self.inhibit_dn = TTLinear(dim, r, bias=False)
+        self.inhibit_up = TTLinear(r, dim, bias=False)
+
+        # Gate MLP: x → g ∈ [0, 1]  (conditioned on pre-norm hidden state)
+        self.gate_fc1 = TTLinear(dim, gate_hidden, bias=False)
+        self.gate_fc2 = TTLinear(gate_hidden, 1, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        logical_out: torch.Tensor,
+        gen_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x:           ``(B, S, dim)`` — pre-norm hidden state (gate input).
+            logical_out: ``(B, S, dim)`` — logical hemisphere output.
+            gen_out:     ``(B, S, dim)`` — generative hemisphere output.
+
+        Returns:
+            logical_out': ``(B, S, dim)`` — after IHI from generative side.
+            gen_out':     ``(B, S, dim)`` — after excitatory from logical side.
+        """
+        # Compute dynamic gate from current hidden state
+        g = torch.sigmoid(self.gate_fc2(F.silu(self.gate_fc1(x))))  # (B, S, 1)
+
+        # Excitatory path: logical → generative
+        cal_excit = g * self.excit_up(F.relu(self.excit_dn(logical_out)))
+
+        # Inhibitory path: generative → logical (net IHI — we negate)
+        cal_inhibit = g * self.inhibit_up(F.relu(self.inhibit_dn(gen_out)))
+
+        logical_out_prime = logical_out - cal_inhibit   # IHI suppresses logical
+        gen_out_prime = gen_out + cal_excit             # excitatory boosts generative
+
+        return logical_out_prime, gen_out_prime
+
+
+# ---------------------------------------------------------------------------
 # DualHemisphereAttention
 # ---------------------------------------------------------------------------
 
@@ -248,6 +369,12 @@ class DualHemisphereAttention(BaseAttention):
         """Fraction of heads assigned to the logical hemisphere (0 < f < 1).
         The remainder go to the generative hemisphere.
         Defaults to 0.5 (equal split).
+        """
+        # --- corpus callosum (optional, per-layer) ---
+        corpus_callosum: "CorpusCallosum.Config | None" = None
+        """If set, a CorpusCallosum module is applied after the two hemisphere
+        forward passes but before the MoralGovernor blend.  Set to None to
+        operate in pure segregated mode (no interhemispheric transfer).
         """
         # --- moral governor hyper-params ---
         moral_gate_hidden: int | None = None
@@ -312,6 +439,11 @@ class DualHemisphereAttention(BaseAttention):
         if config.rope_max_seq_len > config.rope_original_seq_len:
             mscale = 0.1 * config.mscale * math.log(config.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
+
+        # ---- Corpus Callosum (optional) ----
+        self.corpus_callosum: CorpusCallosum | None = None
+        if config.corpus_callosum is not None:
+            self.corpus_callosum = config.corpus_callosum.build()
 
         # ---- Moral Governor ----
         self.moral_governor = MoralGovernor(
@@ -390,10 +522,30 @@ class DualHemisphereAttention(BaseAttention):
             k = k[:, :, -n_heads:, :]
             v = v[:, :, -n_heads:, :]
 
-        out = self.inner_attention(
-            q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
-        ).contiguous()
-        out = out.view(bsz, seqlen, -1)
+        # When qk_head_dim != v_head_dim (always in MLA since qk includes RoPE
+        # dims), MPS SDPA returns q-shaped output instead of v-shaped.
+        # Fall back to a manual causal attention in that case.
+        if self.qk_head_dim == self.v_head_dim:
+            out = self.inner_attention(
+                q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
+            ).contiguous()
+            out = out.view(bsz, seqlen, n_heads * self.v_head_dim)
+        else:
+            # Manual causal scaled dot-product attention.
+            # (B, S, H, D) -> (B, H, S, D)
+            q_t = q.transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.softmax_scale
+            # Apply causal mask
+            causal = torch.tril(
+                torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device)
+            )
+            scores = scores.masked_fill(~causal, float("-inf"))
+            attn_weights = torch.softmax(scores.float(), dim=-1).to(q_t.dtype)
+            out = torch.matmul(attn_weights, v_t)   # (B, H, S, v_head_dim)
+            out = out.transpose(1, 2).contiguous()  # (B, S, H, v_head_dim)
+            out = out.view(bsz, seqlen, n_heads * self.v_head_dim)
         return wo(out)
 
     # ------------------------------------------------------------------
@@ -425,6 +577,11 @@ class DualHemisphereAttention(BaseAttention):
         gen_out = self._hemisphere_forward(
             x, freqs_cis, attention_masks, positions, is_logical=False
         )
+
+        # Apply corpus callosum cross-hemisphere transfer (if this layer has one)
+        if self.corpus_callosum is not None:
+            logical_out, gen_out = self.corpus_callosum(x, logical_out, gen_out)
+
         blended, moral_score, adversarial_prob = self.moral_governor(x, logical_out, gen_out)
         return blended, moral_score, adversarial_prob
 

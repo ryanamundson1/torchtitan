@@ -74,6 +74,86 @@ def eleos_debugmodel_flex_attn() -> Trainer.Config:
     return config
 
 
+def eleos_small() -> Trainer.Config:
+    """Small scale training config (~440M params)."""
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/eleos-tokenizer",
+        model_spec=model_registry("small"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        optimizer=OptimizersContainer.Config(lr=4e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=100,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=2048,
+            steps=1000,
+        ),
+        parallelism=ParallelismConfig(
+            expert_parallel_degree=1,
+            expert_tensor_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(interval=100),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode="selective",
+        ),
+        compile=CompileConfig(enable=True, components=["loss"]),
+    )
+
+
+def eleos_small_moral() -> Trainer.Config:
+    """Moral fine-tuning phase for the small model.
+
+    Run this AFTER eleos_small has been pretrained on c4 to specialize
+    the model's moral reasoning on the curated moral dataset.
+
+    Generate the dataset first:
+        python scripts/generate_moral_dataset.py
+    """
+    cfg = eleos_small()
+    cfg.dataloader = HuggingFaceTextDataLoader.Config(
+        dataset="moral_pretrain",
+        infinite=True,
+    )
+    cfg.training = TrainingConfig(
+        local_batch_size=2,
+        seq_len=2048,
+        steps=500,   # shorter moral fine-tune phase
+    )
+    cfg.optimizer = OptimizersContainer.Config(lr=1e-4)  # lower LR for fine-tune
+    cfg.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=50,
+        decay_ratio=1.0,
+        decay_type="cosine",
+        min_lr_factor=0.1,
+    )
+    cfg.checkpoint = CheckpointManager.Config(interval=100)
+    return cfg
+
+
+def eleos_debugmodel_moral() -> Trainer.Config:
+    """Moral fine-tuning phase for the debug model (fast iteration / CI).
+
+    Generate the dataset first:
+        python scripts/generate_moral_dataset.py
+    """
+    cfg = eleos_debugmodel()
+    cfg.dataloader = HuggingFaceTextDataLoader.Config(
+        dataset="moral_pretrain",
+        infinite=True,
+    )
+    cfg.training = TrainingConfig(
+        local_batch_size=2,
+        seq_len=1024,
+        steps=20,
+    )
+    cfg.optimizer = OptimizersContainer.Config(lr=8e-4)
+    return cfg
+
+
 def eleos_16b() -> Trainer.Config:
     """16B parameter Eleos training config."""
     return Trainer.Config(

@@ -53,13 +53,14 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import DualHemisphereAttention, EleosModel, EleosTransformerBlock
+from .model import CorpusCallosum, DualHemisphereAttention, EleosModel, EleosTransformerBlock
 from .parallelize import parallelize_eleos
 from .state_dict_adapter import EleosStateDictAdapter
 
 __all__ = [
     "parallelize_eleos",
     "EleosModel",
+    "CorpusCallosum",
     "eleos_configs",
 ]
 
@@ -120,6 +121,7 @@ def _make_dha_config(
     moral_gate_hidden: int | None = None,
     moral_override_alpha: float = 0.85,
     adversarial_threshold: float = 0.5,
+    corpus_callosum: CorpusCallosum.Config | None = None,
 ) -> DualHemisphereAttention.Config:
     """Build a fully-specified DualHemisphereAttention.Config for one layer."""
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -223,6 +225,8 @@ def _make_dha_config(
         mask_type=mask_type,
         # Hemisphere split
         logical_head_fraction=logical_head_fraction,
+        # Corpus callosum (None = segregated mode for this layer)
+        corpus_callosum=corpus_callosum,
         # Moral governor
         moral_gate_hidden=moral_gate_hidden,
         moral_override_alpha=moral_override_alpha,
@@ -266,6 +270,12 @@ def _build_eleos_layers(
     moral_gate_hidden: int | None = None,
     moral_override_alpha: float = 0.85,
     adversarial_threshold: float = 0.5,
+    # --- corpus callosum ---
+    callosal_layers: list[int] | None = None,
+    callosal_fiber_rank_thin: int | None = None,
+    callosal_fiber_rank_thick: int | None = None,
+    callosal_thick_layers: list[int] | None = None,
+    callosal_gate_hidden: int | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build per-layer EleosTransformerBlock configs.
 
@@ -275,6 +285,20 @@ def _build_eleos_layers(
             If ``None``, every layer uses ``default_logical_head_fraction``.
         default_logical_head_fraction: Fallback fraction used when
             ``logical_head_fractions`` is ``None``.
+        callosal_layers: Layer indices that receive a CorpusCallosum module.
+            Corresponds to anatomical regions: genu (early), midbody (middle),
+            isthmus (mid-late), splenium (final). If ``None``, no callosal
+            connections are added (pure segregated mode).
+        callosal_fiber_rank_thin: Rank for genu/splenium (associative) layers.
+            Defaults to ``max(16, dim // 8)``.
+        callosal_fiber_rank_thick: Rank for midbody (sensorimotor) layers.
+            Defaults to ``max(32, dim // 4)``.
+        callosal_thick_layers: Subset of ``callosal_layers`` that use the
+            thick-fiber (midbody) rank.  Defaults to the middle 40% of
+            ``callosal_layers``.
+        callosal_gate_hidden: Hidden dim of the callosal gate MLP.
+            Defaults to ``max(16, dim // 8)``.  Smaller values are preferred
+            since the gate only needs to compute a scalar switch signal.
     """
     if logical_head_fractions is not None:
         assert len(logical_head_fractions) == n_layers, (
@@ -284,8 +308,35 @@ def _build_eleos_layers(
     else:
         logical_head_fractions = [default_logical_head_fraction] * n_layers
 
+    # --- Resolve callosal fiber ranks ---
+    _thin_rank = callosal_fiber_rank_thin or max(16, dim // 8)
+    _thick_rank = callosal_fiber_rank_thick or max(32, dim // 4)
+    _callosal_set = set(callosal_layers) if callosal_layers else set()
+    # Layers that use the thick (midbody) fiber rank
+    if callosal_thick_layers is not None:
+        _thick_set = set(callosal_thick_layers)
+    elif callosal_layers:
+        # Default: middle 40% of callosal layers are midbody (thick)
+        sorted_cal = sorted(callosal_layers)
+        n_cal = len(sorted_cal)
+        lo = n_cal // 4
+        hi = 3 * n_cal // 4
+        _thick_set = set(sorted_cal[lo:hi])
+    else:
+        _thick_set = set()
+
     layers = []
     for layer_id in range(n_layers):
+        # Resolve corpus callosum config for this layer
+        callosum_cfg: CorpusCallosum.Config | None = None
+        if layer_id in _callosal_set:
+            fiber_rank = _thick_rank if layer_id in _thick_set else _thin_rank
+            callosum_cfg = CorpusCallosum.Config(
+                dim=dim,
+                fiber_rank=fiber_rank,
+                gate_hidden=callosal_gate_hidden,
+            )
+
         attn_cfg = _make_dha_config(
             layer_id=layer_id,
             dim=dim,
@@ -302,6 +353,7 @@ def _build_eleos_layers(
             moral_gate_hidden=moral_gate_hidden,
             moral_override_alpha=moral_override_alpha,
             adversarial_threshold=adversarial_threshold,
+            corpus_callosum=callosum_cfg,
         )
 
         if layer_id < n_dense_layers:
@@ -406,6 +458,18 @@ def _debugmodel() -> EleosModel.Config:
         router_score_func="softmax",
         score_before_experts=False,
         logical_head_fractions=fractions,
+        # Corpus callosum — 6 layers (dim=256), topographic:
+        #   genu=0       (thin)  → planning / higher-order
+        #   midbody=2-3  (thick) → integration hub
+        #   splenium=5   (thin)  → perceptual synthesis
+        # fiber_rank_thin = 24  (~9% of dim, associative fibers)
+        # fiber_rank_thick = 48 (~19% of dim, fast sensorimotor fibers)
+        # gate_hidden = 16      (minimal — gate is binary switch only)
+        callosal_layers=[0, 2, 3, 5],
+        callosal_thick_layers=[2, 3],
+        callosal_fiber_rank_thin=24,
+        callosal_fiber_rank_thick=48,
+        callosal_gate_hidden=16,
     )
     return EleosModel.Config(
         vocab_size=vocab_size,
@@ -453,6 +517,16 @@ def _debugmodel_flex_attn() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        # Corpus callosum — 6 layers (dim=256), topographic:
+        #   genu=0       (thin)  → planning / higher-order
+        #   midbody=2-3  (thick) → integration hub
+        #   splenium=5   (thin)  → perceptual synthesis
+        # Same parameters as _debugmodel for consistency
+        callosal_layers=[0, 2, 3, 5],
+        callosal_thick_layers=[2, 3],
+        callosal_fiber_rank_thin=24,
+        callosal_fiber_rank_thick=48,
+        callosal_gate_hidden=16,
     )
     return EleosModel.Config(
         vocab_size=vocab_size,
@@ -514,6 +588,20 @@ def _16b() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        # Corpus callosum — 27 layers (dim=2048), topographic mapping:
+        #   genu=0-1       (thin)  → prefrontal planning
+        #   midbody=7-16   (thick) → motor/sensory integration
+        #   isthmus=17-19  (thin)  → auditory/temporal
+        #   splenium=25-26 (thin)  → visual/perceptual synthesis
+        # fiber_rank_thin = 128 (dim//16, ~6% of dim — associative fibers)
+        # fiber_rank_thick = 256 (dim//8,  ~12% of dim — fast sensorimotor)
+        # gate_hidden = 64       (capped — gate is a scalar switch, not complex reasoning)
+        # Callosal params add ~29M params total — ~0.2% of 16B active params
+        callosal_layers=[0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 25, 26],
+        callosal_thick_layers=[7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        callosal_fiber_rank_thin=128,
+        callosal_fiber_rank_thick=256,
+        callosal_gate_hidden=64,
     )
     return EleosModel.Config(
         vocab_size=vocab_size,
@@ -568,6 +656,20 @@ def _236b() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        # Corpus callosum — 60 layers (dim=5120), topographic mapping:
+        #   genu=0-3       (thin)  → prefrontal, highest-order cognition
+        #   midbody=15-37  (thick) → large sensorimotor integration band
+        #   isthmus=38-44  (thin)  → auditory/temporal
+        #   splenium=57-59 (thin)  → visual, perceptual synthesis
+        # fiber_rank_thin = 256 (dim//20, ~5% of dim — capped for memory)
+        # fiber_rank_thick = 512 (dim//10, ~10% of dim — fast fibers)
+        # gate_hidden = 64       (fixed cap — gate complexity doesn't scale with dim)
+        # Callosal overhead ≈ 0.5% of total params at this scale
+        callosal_layers=[*range(0, 4), *range(15, 45), *range(57, 60)],
+        callosal_thick_layers=list(range(15, 38)),
+        callosal_fiber_rank_thin=256,
+        callosal_fiber_rank_thick=512,
+        callosal_gate_hidden=64,
     )
     return EleosModel.Config(
         vocab_size=vocab_size,
@@ -622,6 +724,83 @@ def _671b() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        # Corpus callosum — 61 layers (dim=7168), topographic mapping:
+        #   genu=0-3       (thin)  → prefrontal, executive function
+        #   midbody=15-38  (thick) → primary motor + somatosensory
+        #   isthmus=39-46  (thin)  → auditory cortex connections
+        #   splenium=58-60 (thin)  → visual cortex, perceptual synthesis
+        # fiber_rank_thin = 256 (dim//28, ~3.5% of dim — thinnest callosal budget)
+        # fiber_rank_thick = 512 (dim//14, ~7% of dim — fast sensorimotor fibers)
+        # gate_hidden = 64       (fixed cap — sigmoid scalar, no benefit from larger)
+        # Callosal overhead ≈ 0.4% of total params at this scale
+        callosal_layers=[*range(0, 4), *range(15, 47), *range(58, 61)],
+        callosal_thick_layers=list(range(15, 39)),
+        callosal_fiber_rank_thin=256,
+        callosal_fiber_rank_thick=512,
+        callosal_gate_hidden=64,
+    )
+    return EleosModel.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        moral_loss_weight=1e-3,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=_rope_config(rope_dim),
+        layers=layers,
+    )
+
+
+def _small() -> EleosModel.Config:
+    """~440M parameter model designed specifically to train comfortably on a MacBook/locally."""
+    dim, n_layers, vocab_size = 768, 12, 102400
+    n_heads = 12
+    rope_dim = 64
+
+    # Simple 50/50 split for all layers
+    fractions = [0.50] * n_layers
+
+    layers = _build_eleos_layers(
+        n_layers=n_layers,
+        n_dense_layers=1,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=0,
+        kv_lora_rank=256,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=128,
+        mscale=0.70,
+        dense_hidden_dim=2048,
+        moe_hidden_dim=512,
+        num_experts=16,
+        num_shared_experts=2,
+        router_top_k=4,
+        router_score_func="softmax",
+        score_before_experts=False,
+        inner_attention=FlexAttention.Config(),
+        mask_type="block_causal",
+        logical_head_fractions=fractions,
+        # Corpus callosum — 12 layers (dim=768), topographic mapping:
+        #   genu=0-1      (thin)  → prefrontal, planning
+        #   midbody=4-7   (thick) → motor/somatosensory integration
+        #   isthmus=8-9   (thin)  → auditory/temporal
+        #   splenium=10-11(thin)  → perceptual synthesis
+        # fiber_rank_thin = 48  (dim//16, ~6% of dim — associative fibers)
+        # fiber_rank_thick = 96  (dim//8,  ~12% of dim — fast sensorimotor)
+        # gate_hidden = 24       (dim//32 — minimal gate for scalar switch)
+        # Callosal overhead ≈ 0.8% of total params at this scale
+        callosal_layers=[0, 1, 4, 5, 6, 7, 8, 9, 10, 11],
+        callosal_thick_layers=[4, 5, 6, 7],
+        callosal_fiber_rank_thin=48,
+        callosal_fiber_rank_thick=96,
+        callosal_gate_hidden=24,
     )
     return EleosModel.Config(
         vocab_size=vocab_size,
@@ -648,6 +827,7 @@ def _671b() -> EleosModel.Config:
 eleos_configs = {
     "debugmodel": _debugmodel,
     "debugmodel_flex_attn": _debugmodel_flex_attn,
+    "small": _small,
     "16B": _16b,
     "236B": _236b,
     "671B": _671b,

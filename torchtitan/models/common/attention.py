@@ -380,10 +380,20 @@ class ScaledDotProductAttention(LocalMapInnerAttention):
     ) -> torch.Tensor:
         # Transpose to (bs, heads, seq, dim) for SDPA
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        with sdpa_kernel(self.sdpa_backends, set_priority=True):
+        # On MPS, the sdpa_kernel context manager with CUDA-specific backends
+        # (CUDNN, FLASH) causes incorrect output shapes when qk_head_dim ≠
+        # v_head_dim (MPS returns q-shaped output instead of v-shaped).
+        # Skip the context manager on MPS so PyTorch uses the native MPS SDPA
+        # path, which correctly returns v_head_dim-shaped output.
+        if q.device.type == "mps":
             out = F.scaled_dot_product_attention(
                 q, k, v, scale=scale, is_causal=is_causal, enable_gqa=enable_gqa
             )
+        else:
+            with sdpa_kernel(self.sdpa_backends, set_priority=True):
+                out = F.scaled_dot_product_attention(
+                    q, k, v, scale=scale, is_causal=is_causal, enable_gqa=enable_gqa
+                )
         # Transpose back to (bs, seq, heads, dim)
         return out.transpose(1, 2)
 

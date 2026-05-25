@@ -116,7 +116,7 @@ def test_generate(
     model_config = config.model_spec.model
     model_config.update_from_config(trainer_config=config)
 
-    init_device = "meta" if world_size > 1 else device
+    init_device = "meta"
     with torch.device(init_device):
         logger.info(f"Init model on init_device: {init_device}")
         model = model_config.build()
@@ -162,8 +162,9 @@ def test_generate(
 
     # materalize model
     model.to_empty(device=device_type)
-    with torch.no_grad():
-        model.init_weights()
+    if not checkpoint_path:
+        with torch.no_grad():
+            model.init_weights()
     model.eval()
 
     state_dict = model.state_dict()

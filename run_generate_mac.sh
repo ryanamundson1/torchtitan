@@ -34,6 +34,7 @@ fi
 
 if [ "$NGPU" = "1" ]; then
     PYTORCH_ALLOC_CONF="expandable_segments:True" \
+    PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 \
     MASTER_ADDR="127.0.0.1" \
     MASTER_PORT="29500" \
     GLOO_SOCKET_IFNAME="lo0" \

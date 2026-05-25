@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 try:
     from torch.distributed.checkpoint._consolidate_hf_safetensors import (
@@ -557,7 +558,20 @@ class CheckpointManager(Configurable):
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             self.states[MODEL].load_state_dict(state_dict)
         else:
-            dcp.load(state_dict, checkpoint_id=checkpoint_id)
+            # On Mac/MPS with Python 3.13, dist.gather_object (gloo backend) fails
+            # to pickle code objects during the DCP load-plan gather step. Passing
+            # no_dist=True on single-rank setups bypasses the distributed gather
+            # entirely — semantically identical since no coordination is needed.
+            no_dist = not dist.is_initialized() or dist.get_world_size() == 1
+            # allow_partial_load=True lets DCP skip keys present in the current
+            # model/optimizer but absent from the checkpoint (e.g. new layers added
+            # after the checkpoint was saved). Those weights stay at init values.
+            dcp.load(
+                state_dict,
+                checkpoint_id=checkpoint_id,
+                no_dist=no_dist,
+                planner=DefaultLoadPlanner(allow_partial_load=True),
+            )
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
