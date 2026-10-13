@@ -778,6 +778,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
+        # Empty device cache (MPS/CUDA) at the end of each step to prevent memory fragmentation and OOM
+        if hasattr(utils.device_module, "empty_cache"):
+            utils.device_module.empty_cache()
+
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return

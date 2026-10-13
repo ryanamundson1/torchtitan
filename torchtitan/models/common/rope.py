@@ -236,13 +236,21 @@ def _reshape_for_broadcast_complex(
     else:
         assert positions.shape == (x.shape[0], seqlen)
         freqs_cis_expanded = freqs_cis[None, :, None, :].expand(x.shape[0], -1, -1, -1)
-        freqs_cis = torch.gather(
-            freqs_cis_expanded,
-            dim=1,
-            index=positions.view(x.shape[0], seqlen, 1, 1).expand(
-                x.shape[0], seqlen, 1, freqs_cis_expanded.shape[-1]
-            ),
-        )
+        if torch.is_complex(freqs_cis_expanded):
+            freqs_real = torch.view_as_real(freqs_cis_expanded)
+            index = positions.view(x.shape[0], seqlen, 1, 1, 1).expand(
+                x.shape[0], seqlen, 1, freqs_real.shape[-2], 2
+            )
+            gathered_real = torch.gather(freqs_real, dim=1, index=index)
+            freqs_cis = torch.view_as_complex(gathered_real.contiguous())
+        else:
+            freqs_cis = torch.gather(
+                freqs_cis_expanded,
+                dim=1,
+                index=positions.view(x.shape[0], seqlen, 1, 1).expand(
+                    x.shape[0], seqlen, 1, freqs_cis_expanded.shape[-1]
+                ),
+            )
         return freqs_cis
 
 

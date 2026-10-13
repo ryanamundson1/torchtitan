@@ -445,6 +445,9 @@ def set_pg_timeouts(
     yet due to slow operations permitted under the old timeout value, but other faster ranks may
     start issuing collectives under the new shorter timeout and then immediately timeout.
     """
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        return
+
     logger.info(
         f"Synchronizing and adjusting timeout for all ProcessGroups to {timeout}"
     )

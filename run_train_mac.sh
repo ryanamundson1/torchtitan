@@ -52,17 +52,17 @@ else
     if [ "$NGPU" = "1" ]; then
         PYTORCH_ALLOC_CONF="expandable_segments:True" \
         TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
-        MASTER_ADDR="127.0.0.1" \
-        MASTER_PORT="29500" \
-        GLOO_SOCKET_IFNAME="lo0" \
+        MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"} \
+        MASTER_PORT=${MASTER_PORT:-"29500"} \
+        GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-"lo0"} \
         WORLD_SIZE=1 RANK=0 LOCAL_RANK=0 \
         $PYTHON_EXEC -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"
     else
         PYTORCH_ALLOC_CONF="expandable_segments:True" \
         TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
-        MASTER_ADDR="127.0.0.1" \
-        MASTER_PORT="29500" \
-        GLOO_SOCKET_IFNAME="lo0" \
+        MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"} \
+        MASTER_PORT=${MASTER_PORT:-"29500"} \
+        GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-"lo0"} \
         torchrun --nproc_per_node=${NGPU} --standalone \
         --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
         -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"

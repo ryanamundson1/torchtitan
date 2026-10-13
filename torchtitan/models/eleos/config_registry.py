@@ -75,11 +75,11 @@ def eleos_debugmodel_flex_attn() -> Trainer.Config:
 
 
 def eleos_small() -> Trainer.Config:
-    """Small scale training config (~440M params)."""
+    """Small scale training config (~370M params with tied embeddings)."""
     return Trainer.Config(
         hf_assets_path="./assets/hf/eleos-tokenizer",
         model_spec=model_registry("small"),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="fineweb_edu"),
         optimizer=OptimizersContainer.Config(lr=4e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=100,
@@ -88,9 +88,10 @@ def eleos_small() -> Trainer.Config:
             min_lr_factor=0.1,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=2048,
-            steps=1000,
+            local_batch_size=1,
+            global_batch_size=32,
+            seq_len=1024,
+            steps=10000,
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,

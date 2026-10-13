@@ -356,6 +356,20 @@ class DualHemisphereAttention(BaseAttention):
         qk_nope_head_dim: int = 128
         qk_rope_head_dim: int = 64
         v_head_dim: int = 128
+        # --- Per-hemisphere head dimensions (biological structural asymmetry) --------
+        # Logical hemisphere: larger qk_nope / v dims → deeper per-position processing,
+        #   narrow receptive field — analogue of left-hemisphere fine temporal resolution
+        #   / gamma-band oscillations ~20–40 ms (Poeppel AST hypothesis).
+        # Creative hemisphere: smaller dims but proportionally more heads → broader
+        #   parallel coverage, softer attention — analogue of right-hemisphere coarse
+        #   temporal / theta-band oscillations ~150–250 ms.
+        # The RoPE dim is kept identical across hemispheres (positional encoding shared).
+        # Falls back to the shared qk_nope_head_dim / v_head_dim when set to None.
+        qk_nope_head_dim_logical: int | None = None
+        v_head_dim_logical: int | None = None
+        qk_nope_head_dim_gen: int | None = None
+        v_head_dim_gen: int | None = None
+        # ----------------------------------------------------------------------------
         inner_attention: LocalMapInnerAttention.Config = field(
             default_factory=ScaledDotProductAttention.Config
         )
@@ -402,6 +416,35 @@ class DualHemisphereAttention(BaseAttention):
             f"n_gen_heads must be >= 1; reduce logical_head_fraction or increase n_heads"
         )
 
+        # --- Per-hemisphere head dims (biological structural asymmetry) ---------------
+        # Logical: larger qk_nope and v dims → deeper per-position processing.
+        # Creative: smaller dims but proportionally more heads → broader coverage.
+        # Falls back to shared defaults when config fields are None.
+        self.qk_nope_head_dim_logical = (
+            config.qk_nope_head_dim_logical
+            if config.qk_nope_head_dim_logical is not None
+            else config.qk_nope_head_dim
+        )
+        self.qk_nope_head_dim_gen = (
+            config.qk_nope_head_dim_gen
+            if config.qk_nope_head_dim_gen is not None
+            else config.qk_nope_head_dim
+        )
+        self.v_head_dim_logical = (
+            config.v_head_dim_logical
+            if config.v_head_dim_logical is not None
+            else config.v_head_dim
+        )
+        self.v_head_dim_gen = (
+            config.v_head_dim_gen
+            if config.v_head_dim_gen is not None
+            else config.v_head_dim
+        )
+        # Full head dims per hemisphere (nope + shared rope)
+        self.qk_head_dim_logical = self.qk_nope_head_dim_logical + config.qk_rope_head_dim
+        self.qk_head_dim_gen = self.qk_nope_head_dim_gen + config.qk_rope_head_dim
+        # -------------------------------------------------------------------------------
+
         # ---- Q projections: logical hemisphere ----
         if self.q_lora_rank == 0:
             assert config.wq_logical is not None, "wq_logical required when q_lora_rank==0"
@@ -434,11 +477,22 @@ class DualHemisphereAttention(BaseAttention):
         # ---- Inner attention (shared kernel) ----
         self.inner_attention = config.inner_attention.build()
 
-        # ---- Softmax scale ----
-        self.softmax_scale = self.qk_head_dim ** -0.5
+        # ---- Per-hemisphere softmax scales + learned correction ----------------------
+        # Base scales are derived from per-hemisphere head dims (larger dim → smaller,
+        # sharper base scale).  A learned log-scale parameter per hemisphere biases this
+        # during training — logical sharpens (positive), creative softens (negative).
+        self.softmax_scale_logical = self.qk_head_dim_logical ** -0.5
+        self.softmax_scale_gen = self.qk_head_dim_gen ** -0.5
         if config.rope_max_seq_len > config.rope_original_seq_len:
             mscale = 0.1 * config.mscale * math.log(config.rope_factor) + 1.0
-            self.softmax_scale = self.softmax_scale * mscale * mscale
+            self.softmax_scale_logical = self.softmax_scale_logical * mscale * mscale
+            self.softmax_scale_gen = self.softmax_scale_gen * mscale * mscale
+        # Learned per-hemisphere attention sharpness (log-space → always positive).
+        # Initialised to 0 so the effective multiplier starts at exp(0) = 1.0.
+        # These are scalar nn.Parameters; no tensor-parallel sharding is required.
+        self.logical_attn_log_scale = nn.Parameter(torch.zeros(1))
+        self.gen_attn_log_scale = nn.Parameter(torch.zeros(1))
+        # ---------------------------------------------------------------------------
 
         # ---- Corpus Callosum (optional) ----
         self.corpus_callosum: CorpusCallosum | None = None
@@ -452,6 +506,20 @@ class DualHemisphereAttention(BaseAttention):
             moral_override_alpha=config.moral_override_alpha,
             adversarial_threshold=config.adversarial_threshold,
         )
+
+    def _init_self_parameters(self) -> None:
+        """Initialize this module's own parameters.
+
+        The learned per-hemisphere log-scale parameters are plain ``nn.Parameter``
+        tensors (not wrapped in a child ``Module``) and therefore bypass the
+        ``param_init`` dict mechanism.  We initialise them to zero here
+        (``exp(0) = 1.0`` — neutral at the start of training) and explicitly skip
+        the base-class path, which would raise because ``_param_init`` is ``None``
+        on ``DualHemisphereAttention`` (all other param init is delegated to child
+        Module configs such as ``Linear.Config`` and ``RMSNorm.Config``).
+        """
+        nn.init.zeros_(self.logical_attn_log_scale)
+        nn.init.zeros_(self.gen_attn_log_scale)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -474,25 +542,76 @@ class DualHemisphereAttention(BaseAttention):
             q_norm = self.q_norm_logical if is_logical else self.q_norm_gen
             wq_b = self.wq_b_logical if is_logical else self.wq_b_gen
             q = wq_b(q_norm(wq_a(x)))
-        return q.view(bsz, seqlen, n_heads, self.qk_head_dim)
+        qk_head_dim = self.qk_head_dim_logical if is_logical else self.qk_head_dim_gen
+        return q.view(bsz, seqlen, n_heads, qk_head_dim)
 
     def _compute_kv(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Shared KV compression used by both hemispheres."""
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        """Compute shared KV compression and return per-hemisphere ``(k, v)`` pairs.
+
+        The ``wkv_b`` output is laid out as ``[logical_block | gen_block]``, where
+        each block is sized to its hemisphere's own ``qk_nope_head_dim`` and
+        ``v_head_dim``.  This lets the logical hemisphere carry deeper (wider)
+        key/value representations while the creative hemisphere uses shallower,
+        broader ones — directly modelling the fine vs. coarse temporal integration
+        windows of the biological hemispheres.
+
+        Returns:
+            ``(k_logical, v_logical), (k_gen, v_gen)`` — per-hemisphere tensors:
+            k shaped ``(B, S, n_heads, qk_head_dim)``,
+            v shaped ``(B, S, n_heads, v_head_dim)``.
+        """
         kv = self.wkv_a(x)
         kv_lat, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # k_pe: (B, S, rope_dim) → unsqueeze head dim for RoPE → (B, S, 1, rope_dim)
         k_pe = apply_rotary_emb_single_complex(k_pe.unsqueeze(2), freqs_cis, positions)
         kv_lat = self.wkv_b(self.kv_norm(kv_lat))
+
         bsz, seqlen, _ = x.shape
-        n_local_heads = self.n_logical_heads + self.n_gen_heads
-        kv_lat = kv_lat.view(bsz, seqlen, n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv_lat, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.cat([k_nope, k_pe.expand(-1, -1, n_local_heads, -1)], dim=-1)
-        return k, v
+
+        # wkv_b output: [logical_block | gen_block]
+        logical_kv_flat = self.n_logical_heads * (
+            self.qk_nope_head_dim_logical + self.v_head_dim_logical
+        )
+        gen_kv_flat = self.n_gen_heads * (
+            self.qk_nope_head_dim_gen + self.v_head_dim_gen
+        )
+        kv_lat_log, kv_lat_gen = torch.split(
+            kv_lat, [logical_kv_flat, gen_kv_flat], dim=-1
+        )
+
+        # --- Logical hemisphere ---
+        kv_lat_log = kv_lat_log.view(
+            bsz, seqlen, self.n_logical_heads,
+            self.qk_nope_head_dim_logical + self.v_head_dim_logical,
+        )
+        k_nope_log, v_log = torch.split(
+            kv_lat_log, [self.qk_nope_head_dim_logical, self.v_head_dim_logical], dim=-1
+        )
+        k_log = torch.cat(
+            [k_nope_log, k_pe.expand(-1, -1, self.n_logical_heads, -1)], dim=-1
+        )
+
+        # --- Creative hemisphere ---
+        kv_lat_gen = kv_lat_gen.view(
+            bsz, seqlen, self.n_gen_heads,
+            self.qk_nope_head_dim_gen + self.v_head_dim_gen,
+        )
+        k_nope_gen, v_gen = torch.split(
+            kv_lat_gen, [self.qk_nope_head_dim_gen, self.v_head_dim_gen], dim=-1
+        )
+        k_gen = torch.cat(
+            [k_nope_gen, k_pe.expand(-1, -1, self.n_gen_heads, -1)], dim=-1
+        )
+
+        return (k_log, v_log), (k_gen, v_gen)
 
     def _hemisphere_forward(
         self,
@@ -501,42 +620,63 @@ class DualHemisphereAttention(BaseAttention):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None,
         is_logical: bool,
+        k: torch.Tensor,
+        v: torch.Tensor,
     ) -> torch.Tensor:
-        """Run one hemisphere and return its projected output (dim-space)."""
+        """Run one hemisphere and return its projected output (dim-space).
+
+        Args:
+            k: Pre-computed key tensor ``(B, S, n_hemisphere_heads, qk_head_dim)``
+               from :meth:`_compute_kv`.
+            v: Pre-computed value tensor ``(B, S, n_hemisphere_heads, v_head_dim)``
+               from :meth:`_compute_kv`.
+        """
         bsz, seqlen, _ = x.shape
         n_heads = self.n_logical_heads if is_logical else self.n_gen_heads
         wo = self.wo_logical if is_logical else self.wo_gen
+        qk_nope_head_dim = (
+            self.qk_nope_head_dim_logical if is_logical else self.qk_nope_head_dim_gen
+        )
+        qk_head_dim = self.qk_head_dim_logical if is_logical else self.qk_head_dim_gen
+        v_head_dim = self.v_head_dim_logical if is_logical else self.v_head_dim_gen
 
-        # Q
+        # Effective softmax scale: base (derived from head dim) × learned correction.
+        # The learned log-scale starts at 0 (multiplier = 1.0) and diverges during
+        # training: logical sharpens (positive → gamma-like focus),
+        #           creative softens  (negative → theta-like broad sweep).
+        attn_log_scale = (
+            self.logical_attn_log_scale if is_logical else self.gen_attn_log_scale
+        )
+        softmax_scale_base = (
+            self.softmax_scale_logical if is_logical else self.softmax_scale_gen
+        )
+        softmax_scale = softmax_scale_base * attn_log_scale.exp()
+
+        # Q projection and RoPE
         q = self._project_q(x, bsz, seqlen, n_heads, is_logical)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope, q_pe = torch.split(q, [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb_single_complex(q_pe, freqs_cis, positions)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
-        # Shared KV (we compute fresh for each hemisphere; note shared weights)
-        k, v = self._compute_kv(x, freqs_cis, positions)
-        if is_logical:
-            k = k[:, :, :n_heads, :]
-            v = v[:, :, :n_heads, :]
-        else:
-            k = k[:, :, -n_heads:, :]
-            v = v[:, :, -n_heads:, :]
+        # Pre-scale Q by the effective softmax scale (equivalent to scale= in the
+        # attention kernel, but avoids passing a tensor where a float is expected).
+        q = q * softmax_scale
 
         # When qk_head_dim != v_head_dim (always in MLA since qk includes RoPE
         # dims), MPS SDPA returns q-shaped output instead of v-shaped.
         # Fall back to a manual causal attention in that case.
-        if self.qk_head_dim == self.v_head_dim:
+        if qk_head_dim == v_head_dim:
             out = self.inner_attention(
-                q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
+                q, k, v, attention_masks=attention_masks, scale=1.0
             ).contiguous()
-            out = out.view(bsz, seqlen, n_heads * self.v_head_dim)
+            out = out.view(bsz, seqlen, n_heads * v_head_dim)
         else:
             # Manual causal scaled dot-product attention.
             # (B, S, H, D) -> (B, H, S, D)
             q_t = q.transpose(1, 2)
             k_t = k.transpose(1, 2)
             v_t = v.transpose(1, 2)
-            scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.softmax_scale
+            scores = torch.matmul(q_t, k_t.transpose(-2, -1))   # Q pre-scaled above
             # Apply causal mask
             causal = torch.tril(
                 torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device)
@@ -545,7 +685,7 @@ class DualHemisphereAttention(BaseAttention):
             attn_weights = torch.softmax(scores.float(), dim=-1).to(q_t.dtype)
             out = torch.matmul(attn_weights, v_t)   # (B, H, S, v_head_dim)
             out = out.transpose(1, 2).contiguous()  # (B, S, H, v_head_dim)
-            out = out.view(bsz, seqlen, n_heads * self.v_head_dim)
+            out = out.view(bsz, seqlen, n_heads * v_head_dim)
         return wo(out)
 
     # ------------------------------------------------------------------
@@ -571,11 +711,16 @@ class DualHemisphereAttention(BaseAttention):
             moral_score:      ``(batch, seq, 1)``   — per-token moral alignment
             adversarial_prob: ``(batch, seq, 1)``   — per-token adversarial prob
         """
+        # Compute shared KV once — avoids duplicate wkv_a / wkv_b computation.
+        (k_log, v_log), (k_gen, v_gen) = self._compute_kv(x, freqs_cis, positions)
+
         logical_out = self._hemisphere_forward(
-            x, freqs_cis, attention_masks, positions, is_logical=True
+            x, freqs_cis, attention_masks, positions,
+            is_logical=True, k=k_log, v=v_log,
         )
         gen_out = self._hemisphere_forward(
-            x, freqs_cis, attention_masks, positions, is_logical=False
+            x, freqs_cis, attention_masks, positions,
+            is_logical=False, k=k_gen, v=v_gen,
         )
 
         # Apply corpus callosum cross-hemisphere transfer (if this layer has one)
@@ -667,6 +812,7 @@ class EleosModel(Decoder):
     class Config(Decoder.Config):
         dim: int = 2048
         vocab_size: int = 102400
+        enable_weight_tying: bool = False
         moral_loss_weight: float = 1e-3
         """Weight applied to the moral auxiliary loss term.
 
@@ -685,6 +831,10 @@ class EleosModel(Decoder):
             training = trainer_config.training
             parallelism = trainer_config.parallelism
             debug = trainer_config.debug
+            if self.enable_weight_tying and parallelism.pipeline_parallel_degree > 1:
+                raise NotImplementedError(
+                    "Weight tying is not supported with pipeline parallelism."
+                )
             seq_len = training.seq_len
             if seq_len > self.rope.max_seq_len:
                 logger.warning(
@@ -729,18 +879,51 @@ class EleosModel(Decoder):
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
             assert isinstance(self.layers[0].attention, DualHemisphereAttention.Config)
+            attn = self.layers[0].attention
+            n_log = max(1, round(attn.n_heads * attn.logical_head_fraction))
+            n_gen = attn.n_heads - n_log
+            qk_nope_log = (
+                attn.qk_nope_head_dim_logical
+                if attn.qk_nope_head_dim_logical is not None
+                else attn.qk_nope_head_dim
+            )
+            qk_nope_gen = (
+                attn.qk_nope_head_dim_gen
+                if attn.qk_nope_head_dim_gen is not None
+                else attn.qk_nope_head_dim
+            )
+            v_log = (
+                attn.v_head_dim_logical
+                if attn.v_head_dim_logical is not None
+                else attn.v_head_dim
+            )
+            v_gen = (
+                attn.v_head_dim_gen
+                if attn.v_head_dim_gen is not None
+                else attn.v_head_dim
+            )
+            # Weighted-average effective head dim across both hemispheres
+            eff_head_dim = int(
+                (
+                    n_log * (qk_nope_log + attn.qk_rope_head_dim + v_log)
+                    + n_gen * (qk_nope_gen + attn.qk_rope_head_dim + v_gen)
+                )
+                / attn.n_heads
+            )
             return get_moe_model_nparams_and_flops(
                 self,
                 model,
-                self.layers[0].attention.n_heads,
-                self.layers[0].attention.qk_nope_head_dim
-                + self.layers[0].attention.qk_rope_head_dim
-                + self.layers[0].attention.v_head_dim,
+                attn.n_heads,
+                eff_head_dim,
                 seq_len,
             )
 
     def __init__(self, config: Config):
         super().__init__(config)
+        self.enable_weight_tying = config.enable_weight_tying
+        if self.enable_weight_tying:
+            self.tok_embeddings.weight = self.output.weight
+
         self.moral_loss_weight = config.moral_loss_weight
         # Accumulate moral scores across all layers during a forward pass.
         # Registered as a non-persistent buffer so it lives on the right device.
@@ -749,6 +932,16 @@ class EleosModel(Decoder):
             torch.zeros(1, dtype=torch.float32),
             persistent=False,
         )
+
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        if self.enable_weight_tying:
+            assert self.tok_embeddings is not None and self.output is not None
+            self.tok_embeddings.weight = self.output.weight
+        super().init_states(buffer_device=buffer_device)
 
     def forward(
         self,

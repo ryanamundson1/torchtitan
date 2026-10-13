@@ -1,0 +1,49 @@
+name: torchtitan-runpod-demo
+
+resources:
+  cloud: runpod
+  # Requesting a single high-end GPU for a test run. Change to H100:1 or A100:8 as needed.
+  accelerators: A100:1
+  # Use spot instances to save up to 60-70% on compute costs
+  use_spot: true
+  # RunPod images default to root; this ensures smooth workspace setup
+  any_of:
+    - image_id: runpod/pytorch:2.4.0-py3.10-cuda12.1.1-developer-base
+
+# Transfer your training files, configuration data, or dataset recipes to the Pod
+envs:
+  MODEL_SIZE: "eleos-16b" # Change to "llama3-70b" or "llama3-demo" depending on your GPU choice
+
+setup: |
+  echo "Setting up dependencies for TorchTitan..."
+  
+  # Ensure git and system utilities are up to date
+  apt-get update && apt-get install -y git build-essential
+
+  # Clone the official TorchTitan repository if it doesn't exist
+  if [ ! -d "torchtitan" ]; then
+    git clone https://github.com
+  fi
+  
+  cd torchtitan
+  
+  # Install necessary PyTorch ecosystem packages (TensorParallel, ContextParallel essentials)
+  pip install --upgrade pip
+  pip install -r requirements.txt
+  
+  # Pre-download tiny or tokenizer files if required by your script variant
+  python -c "import ticket; print('TorchTitan dependencies successfully verified!')"
+
+run: |
+  cd torchtitan
+  
+  echo "Starting TorchTitan training job via PyTorch distributed execution engine..."
+  
+  # RunPod exposes the active GPU cleanly to torchrun.
+  # This executes the default pre-training recipe. For larger models, point to the 8B or 70B TOML configurations.
+  torchrun --nproc_per_node=1 train.py \
+    --config_file train_configs/eleos_16b.toml \
+    training.max_steps=20 \
+    training.data_parallel_degree=1 \
+    training.tensor_parallel_degree=1 \
+    metrics.enable_tensorboard=True

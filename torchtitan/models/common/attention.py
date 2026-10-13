@@ -501,6 +501,10 @@ _compiled_create_block_mask = torch.compile(create_block_mask)
 
 def create_attention_mask(*args, **kwargs):
     """Create an attention mask using compiled create_block_mask."""
+    from torchtitan.tools.utils import device_type
+
+    if "device" not in kwargs and len(args) < 6:
+        kwargs["device"] = device_type
     return _compiled_create_block_mask(*args, **kwargs)
 
 

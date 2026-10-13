@@ -50,7 +50,7 @@ from torchtitan.models.common.config_utils import (
     make_moe_config,
     make_router_config,
 )
-from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import CorpusCallosum, DualHemisphereAttention, EleosModel, EleosTransformerBlock
@@ -75,6 +75,7 @@ _LINEAR_INIT = {
 }
 _NORM_INIT = {"weight": nn.init.ones_}
 _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=1.0)}
+_EMBEDDING_SKIP_INIT = {"weight": skip_param_init}
 
 
 def _output_linear_init(dim: int) -> dict[str, Callable]:
@@ -100,6 +101,16 @@ def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
     }
 
 
+def _scaled_dim(base: int, scale: float) -> int:
+    """Scale a head dimension and round to the nearest multiple of 8.
+
+    Rounding to multiples of 8 ensures hardware-friendly tensor dimensions
+    (avoids padding in GEMM kernels).  Returns at least 8 to prevent degenerate
+    zero-sized dimensions.
+    """
+    return max(8, round(base * scale / 8) * 8)
+
+
 # ---------------------------------------------------------------------------
 # DualHemisphereAttention config builder
 # ---------------------------------------------------------------------------
@@ -114,6 +125,14 @@ def _make_dha_config(
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
+    # Per-hemisphere dims (biological structural asymmetry).
+    # Logical: larger → deeper per-position processing (fine temporal, narrow field).
+    # Creative: smaller → broader coverage, softer attention (coarse temporal, wide field).
+    # Fall back to the shared dim when None.
+    qk_nope_head_dim_logical: int | None = None,
+    v_head_dim_logical: int | None = None,
+    qk_nope_head_dim_gen: int | None = None,
+    v_head_dim_gen: int | None = None,
     mscale: float = 1.0,
     inner_attention=None,
     mask_type: str = "causal",
@@ -124,22 +143,37 @@ def _make_dha_config(
     corpus_callosum: CorpusCallosum.Config | None = None,
 ) -> DualHemisphereAttention.Config:
     """Build a fully-specified DualHemisphereAttention.Config for one layer."""
-    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    # Resolve per-hemisphere dims (fall back to shared defaults when None)
+    _qk_nope_log = (
+        qk_nope_head_dim_logical
+        if qk_nope_head_dim_logical is not None
+        else qk_nope_head_dim
+    )
+    _qk_nope_gen = (
+        qk_nope_head_dim_gen
+        if qk_nope_head_dim_gen is not None
+        else qk_nope_head_dim
+    )
+    _v_log = v_head_dim_logical if v_head_dim_logical is not None else v_head_dim
+    _v_gen = v_head_dim_gen if v_head_dim_gen is not None else v_head_dim
+
+    _qk_head_dim_log = _qk_nope_log + qk_rope_head_dim
+    _qk_head_dim_gen = _qk_nope_gen + qk_rope_head_dim
 
     # Resolve head split
     n_logical = max(1, round(n_heads * logical_head_fraction))
     n_gen = n_heads - n_logical
 
     if q_lora_rank == 0:
-        # ---- Full Q projections ----
+        # ---- Full Q projections (sized to each hemisphere's own qk_head_dim) ----
         wq_logical = Linear.Config(
             in_features=dim,
-            out_features=n_logical * qk_head_dim,
+            out_features=n_logical * _qk_head_dim_log,
             param_init=_LINEAR_INIT,
         )
         wq_gen = Linear.Config(
             in_features=dim,
-            out_features=n_gen * qk_head_dim,
+            out_features=n_gen * _qk_head_dim_gen,
             param_init=_LINEAR_INIT,
         )
         wq_a_logical = wq_b_logical = None
@@ -156,7 +190,7 @@ def _make_dha_config(
         )
         wq_b_logical = Linear.Config(
             in_features=q_lora_rank,
-            out_features=n_logical * qk_head_dim,
+            out_features=n_logical * _qk_head_dim_log,
             param_init=_LINEAR_INIT,
         )
         wq_a_gen = Linear.Config(
@@ -166,7 +200,7 @@ def _make_dha_config(
         )
         wq_b_gen = Linear.Config(
             in_features=q_lora_rank,
-            out_features=n_gen * qk_head_dim,
+            out_features=n_gen * _qk_head_dim_gen,
             param_init=_LINEAR_INIT,
         )
         q_norm_logical = RMSNorm.Config(normalized_shape=q_lora_rank, param_init=_NORM_INIT)
@@ -180,6 +214,11 @@ def _make_dha_config(
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
+        # Per-hemisphere head dims (biological asymmetry)
+        qk_nope_head_dim_logical=_qk_nope_log,
+        v_head_dim_logical=_v_log,
+        qk_nope_head_dim_gen=_qk_nope_gen,
+        v_head_dim_gen=_v_gen,
         mscale=mscale,
         # Q projections
         wq_logical=wq_logical,
@@ -190,7 +229,8 @@ def _make_dha_config(
         wq_b_gen=wq_b_gen,
         q_norm_logical=q_norm_logical,
         q_norm_gen=q_norm_gen,
-        # Shared KV
+        # Shared KV — wkv_b output is laid out as [logical_block | gen_block],
+        # each block sized to its hemisphere's own qk_nope and v dims.
         wkv_a=Linear.Config(
             in_features=dim,
             out_features=kv_lora_rank + qk_rope_head_dim,
@@ -199,21 +239,20 @@ def _make_dha_config(
         kv_norm=RMSNorm.Config(normalized_shape=kv_lora_rank, param_init=_NORM_INIT),
         wkv_b=Linear.Config(
             in_features=kv_lora_rank,
-            # wkv_b must accommodate the largest hemisphere for the nope projection;
-            # we use the full n_heads set here (shared matrix, the hemisphere splits
-            # happen in the Q path).  At runtime the hemispherical KV calls each
-            # pass their own n_heads count to _compute_kv so the view is consistent.
-            out_features=n_heads * (qk_nope_head_dim + v_head_dim),
+            out_features=(
+                n_logical * (_qk_nope_log + _v_log)
+                + n_gen * (_qk_nope_gen + _v_gen)
+            ),
             param_init=_LINEAR_INIT,
         ),
-        # Output projections (one per hemisphere, sized to their head count)
+        # Output projections (sized to per-hemisphere v_head_dim × head count)
         wo_logical=Linear.Config(
-            in_features=n_logical * v_head_dim,
+            in_features=n_logical * _v_log,
             out_features=dim,
             param_init=_depth_init(layer_id),
         ),
         wo_gen=Linear.Config(
-            in_features=n_gen * v_head_dim,
+            in_features=n_gen * _v_gen,
             out_features=dim,
             param_init=_depth_init(layer_id),
         ),
@@ -232,6 +271,7 @@ def _make_dha_config(
         moral_override_alpha=moral_override_alpha,
         adversarial_threshold=adversarial_threshold,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +306,13 @@ def _build_eleos_layers(
     # --- hemisphere split ---
     logical_head_fractions: list[float] | None = None,
     default_logical_head_fraction: float = 0.5,
+    # --- biological structural asymmetry (hemisphere head dim scales) ---
+    # logical_head_dim_scale: >1.0 → logical stream gets larger per-head dims
+    #   (deeper, narrower focus — gamma-band analogue, fine temporal resolution)
+    # gen_head_dim_scale: <1.0 → creative stream gets smaller per-head dims
+    #   (shallower, broader sweep — theta-band analogue, coarse temporal resolution)
+    logical_head_dim_scale: float = 1.0,
+    gen_head_dim_scale: float = 1.0,
     # --- moral governor ---
     moral_gate_hidden: int | None = None,
     moral_override_alpha: float = 0.85,
@@ -285,6 +332,12 @@ def _build_eleos_layers(
             If ``None``, every layer uses ``default_logical_head_fraction``.
         default_logical_head_fraction: Fallback fraction used when
             ``logical_head_fractions`` is ``None``.
+        logical_head_dim_scale: Multiplicative scale applied to ``qk_nope_head_dim``
+            and ``v_head_dim`` for the logical hemisphere.  Values >1.0 produce
+            larger per-head representations (deeper, narrower — gamma-band analogue).
+        gen_head_dim_scale: Multiplicative scale applied to ``qk_nope_head_dim`` and
+            ``v_head_dim`` for the creative hemisphere.  Values <1.0 produce smaller
+            per-head representations (shallower, broader — theta-band analogue).
         callosal_layers: Layer indices that receive a CorpusCallosum module.
             Corresponds to anatomical regions: genu (early), midbody (middle),
             isthmus (mid-late), splenium (final). If ``None``, no callosal
@@ -307,6 +360,13 @@ def _build_eleos_layers(
         )
     else:
         logical_head_fractions = [default_logical_head_fraction] * n_layers
+
+    # Compute per-hemisphere head dims from scale factors.
+    # _scaled_dim rounds to the nearest multiple of 8 for hardware efficiency.
+    _qk_nope_head_dim_logical = _scaled_dim(qk_nope_head_dim, logical_head_dim_scale)
+    _qk_nope_head_dim_gen = _scaled_dim(qk_nope_head_dim, gen_head_dim_scale)
+    _v_head_dim_logical = _scaled_dim(v_head_dim, logical_head_dim_scale)
+    _v_head_dim_gen = _scaled_dim(v_head_dim, gen_head_dim_scale)
 
     # --- Resolve callosal fiber ranks ---
     _thin_rank = callosal_fiber_rank_thin or max(16, dim // 8)
@@ -346,6 +406,10 @@ def _build_eleos_layers(
             qk_nope_head_dim=qk_nope_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
+            qk_nope_head_dim_logical=_qk_nope_head_dim_logical,
+            v_head_dim_logical=_v_head_dim_logical,
+            qk_nope_head_dim_gen=_qk_nope_head_dim_gen,
+            v_head_dim_gen=_v_head_dim_gen,
             mscale=mscale,
             inner_attention=inner_attention,
             mask_type=mask_type,
@@ -458,6 +522,8 @@ def _debugmodel() -> EleosModel.Config:
         router_score_func="softmax",
         score_before_experts=False,
         logical_head_fractions=fractions,
+        logical_head_dim_scale=1.25,
+        gen_head_dim_scale=0.75,
         # Corpus callosum — 6 layers (dim=256), topographic:
         #   genu=0       (thin)  → planning / higher-order
         #   midbody=2-3  (thick) → integration hub
@@ -517,6 +583,8 @@ def _debugmodel_flex_attn() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        logical_head_dim_scale=1.25,
+        gen_head_dim_scale=0.75,
         # Corpus callosum — 6 layers (dim=256), topographic:
         #   genu=0       (thin)  → planning / higher-order
         #   midbody=2-3  (thick) → integration hub
@@ -588,6 +656,8 @@ def _16b() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        logical_head_dim_scale=1.25,
+        gen_head_dim_scale=0.75,
         # Corpus callosum — 27 layers (dim=2048), topographic mapping:
         #   genu=0-1       (thin)  → prefrontal planning
         #   midbody=7-16   (thick) → motor/sensory integration
@@ -656,6 +726,8 @@ def _236b() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        logical_head_dim_scale=1.25,
+        gen_head_dim_scale=0.75,
         # Corpus callosum — 60 layers (dim=5120), topographic mapping:
         #   genu=0-3       (thin)  → prefrontal, highest-order cognition
         #   midbody=15-37  (thick) → large sensorimotor integration band
@@ -724,6 +796,8 @@ def _671b() -> EleosModel.Config:
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
         logical_head_fractions=fractions,
+        logical_head_dim_scale=1.25,
+        gen_head_dim_scale=0.75,
         # Corpus callosum — 61 layers (dim=7168), topographic mapping:
         #   genu=0-3       (thin)  → prefrontal, executive function
         #   midbody=15-38  (thick) → primary motor + somatosensory
@@ -758,7 +832,7 @@ def _671b() -> EleosModel.Config:
 
 
 def _small() -> EleosModel.Config:
-    """~440M parameter model designed specifically to train comfortably on a MacBook/locally."""
+    """~370M parameter model with tied weights and aligned head dims for native MPS SDPA."""
     dim, n_layers, vocab_size = 768, 12, 102400
     n_heads = 12
     rope_dim = 64
@@ -773,7 +847,7 @@ def _small() -> EleosModel.Config:
         n_heads=n_heads,
         q_lora_rank=0,
         kv_lora_rank=256,
-        qk_nope_head_dim=128,
+        qk_nope_head_dim=64,
         qk_rope_head_dim=rope_dim,
         v_head_dim=128,
         mscale=0.70,
@@ -784,9 +858,11 @@ def _small() -> EleosModel.Config:
         router_top_k=4,
         router_score_func="softmax",
         score_before_experts=False,
-        inner_attention=FlexAttention.Config(),
-        mask_type="block_causal",
+        inner_attention=ScaledDotProductAttention.Config(),
+        mask_type="causal",
         logical_head_fractions=fractions,
+        logical_head_dim_scale=1.0,
+        gen_head_dim_scale=1.0,
         # Corpus callosum — 12 layers (dim=768), topographic mapping:
         #   genu=0-1      (thin)  → prefrontal, planning
         #   midbody=4-7   (thick) → motor/somatosensory integration
@@ -805,9 +881,10 @@ def _small() -> EleosModel.Config:
     return EleosModel.Config(
         vocab_size=vocab_size,
         dim=dim,
+        enable_weight_tying=True,
         moral_loss_weight=1e-3,
         tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_SKIP_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
         output=Linear.Config(
