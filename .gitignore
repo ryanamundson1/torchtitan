@@ -17,6 +17,8 @@ torchtitan/datasets/**/*.model
 
 # hf assets
 assets/hf/*
+!assets/hf/eleos-tokenizer
+assets/hf/eleos-tokenizer/.cache
 assets/tokenizer/*
 torchtitan/experiments/flux/assets/*
 
