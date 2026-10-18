@@ -198,12 +198,13 @@ class MoralGovernor(Module):
         # 3. Override blend gate when adversarial intent is detected.
         #    We do a soft interpolation so the gradient can still flow.
         #    override_strength ∈ [0, 1]:  0 = no override, 1 = full override.
-        override_strength = (adversarial_prob > self.adversarial_threshold).float()
+        override_strength = (adversarial_prob > self.adversarial_threshold).to(x.dtype)
         # Interpolate: when adversarial, push alpha toward moral_override_alpha
         alpha = override_strength * self.moral_override_alpha + (1.0 - override_strength) * alpha
+        alpha = alpha.to(x.dtype)
 
         # 4. Blend the two hemispheres
-        blended = alpha * logical_out + (1.0 - alpha) * gen_out
+        blended = (alpha * logical_out + (1.0 - alpha) * gen_out).to(x.dtype)
 
         return blended, moral_score, adversarial_prob
 
@@ -305,8 +306,8 @@ class CorpusCallosum(Module):
         # Inhibitory path: generative → logical (net IHI — we negate)
         cal_inhibit = g * self.inhibit_up(F.relu(self.inhibit_dn(gen_out)))
 
-        logical_out_prime = logical_out - cal_inhibit   # IHI suppresses logical
-        gen_out_prime = gen_out + cal_excit             # excitatory boosts generative
+        logical_out_prime = (logical_out - cal_inhibit).to(logical_out.dtype)   # IHI suppresses logical
+        gen_out_prime = (gen_out + cal_excit).to(gen_out.dtype)             # excitatory boosts generative
 
         return logical_out_prime, gen_out_prime
 
@@ -660,7 +661,7 @@ class DualHemisphereAttention(BaseAttention):
 
         # Pre-scale Q by the effective softmax scale (equivalent to scale= in the
         # attention kernel, but avoids passing a tensor where a float is expected).
-        q = q * softmax_scale
+        q = q * softmax_scale.to(q.dtype)
 
         # When qk_head_dim != v_head_dim (always in MLA since qk includes RoPE
         # dims), MPS SDPA returns q-shaped output instead of v-shaped.
