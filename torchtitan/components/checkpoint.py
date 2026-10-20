@@ -57,6 +57,31 @@ from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
+import pickle
+import traceback as tb
+import torch.distributed.checkpoint.utils as _dcp_utils
+
+def _safe_wrap_exception(exc: BaseException):
+    frames = tb.extract_tb(exc.__traceback__)
+    # In Python 3.13+, tb.extract_tb returns FrameSummary objects containing
+    # unpicklable code objects (FrameSummary._code), causing dist.gather_object
+    # to fail with "TypeError: cannot pickle code objects" whenever any exception
+    # is caught during distributed checkpointing, hiding the actual exception.
+    # Setting _code to None preserves the StackSummary type and all line/file info
+    # while making it cleanly picklable across ranks.
+    for f in frames:
+        if hasattr(f, "_code"):
+            f._code = None
+    try:
+        pickle.dumps(exc)
+        safe_exc = exc
+    except Exception:
+        safe_exc = RuntimeError(f"{type(exc).__name__}: {str(exc)}")
+    return (safe_exc, frames)
+
+_dcp_utils._wrap_exception = _safe_wrap_exception
+
+
 
 MODEL = "model"
 OPTIMIZER = "optimizer"
@@ -504,11 +529,19 @@ class CheckpointManager(Configurable):
                 async_stager=self.stager,
             )
         else:
-            ret = dcp.save(
-                state_dict,
-                storage_writer=storage_writer,
-                checkpoint_id=checkpoint_save_id,
-            )
+            try:
+                ret = dcp.save(
+                    state_dict,
+                    storage_writer=storage_writer,
+                    checkpoint_id=checkpoint_save_id,
+                )
+            except Exception as e:
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                logger.error(
+                    f"[Rank {rank}] dcp.save failed for checkpoint {checkpoint_save_id}: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                raise
 
         if to_hf and fqn_to_index_mapping:
             if consolidate_safetensors_files_on_every_rank is not None:
