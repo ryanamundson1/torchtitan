@@ -713,7 +713,7 @@ class CheckpointManager(Configurable):
                 checkpoint_id = self.initial_load_path
                 if not os.path.isdir(checkpoint_id):
                     raise ValueError(
-                        "checkpoint.initial_load_path is specified but the path is not valid."
+                        f"checkpoint.initial_load_path is specified but '{checkpoint_id}' is not a valid directory."
                     )
                 if from_hf:
                     logger.info(
