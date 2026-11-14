@@ -64,7 +64,7 @@ def linear_warmup_stable_decay(
         assert (
             decay_steps != 0
         ), "decay_steps must not be zero to reach this branch"
-        progress = float(current_step - warmup_stable_steps) / decay_steps
+        progress = min(1.0, max(0.0, float(current_step - warmup_stable_steps) / decay_steps))
 
         if lr_decay_type == "linear":
             curr_adjustment = 1 - progress

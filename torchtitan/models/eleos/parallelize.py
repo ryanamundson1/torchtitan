@@ -237,6 +237,8 @@ def _apply_dha_tp(
         if attn.q_lora_rank == 0:
             layer_plan["attention.wq_logical"] = ColwiseParallel(use_local_output=False)
             layer_plan["attention.wq_gen"] = ColwiseParallel(use_local_output=False)
+            layer_plan["attention.q_norm_logical"] = NoParallel()
+            layer_plan["attention.q_norm_gen"] = NoParallel()
         else:
             layer_plan.update({
                 "attention.wq_a_logical": NoParallel(),
@@ -246,6 +248,9 @@ def _apply_dha_tp(
                 "attention.wq_b_gen": ColwiseParallel(use_local_output=False),
                 "attention.q_norm_gen": NoParallel(),
             })
+
+        if attn.corpus_callosum is not None:
+            layer_plan["attention.corpus_callosum"] = NoParallel()
 
         if not transformer_block.moe_enabled:
             layer_plan.update({

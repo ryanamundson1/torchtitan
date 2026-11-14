@@ -85,7 +85,34 @@ from torchtitan.tools.utils import has_cuda_capability
 # AdversarialDetector
 # ---------------------------------------------------------------------------
 
-TTLinear = Module.from_nn_module(nn.Linear)
+def _init_linear_trunc_normal(linear: nn.Linear, std: float = 0.02) -> None:
+    nn.init.trunc_normal_(linear.weight, std=std, a=-3 * std, b=3 * std)
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+
+
+class _InitLinear(nn.Linear, Module):
+    """Linear layer that uses transformer-standard truncated normal init
+    instead of nn.Linear's default Kaiming uniform init."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        init_std: float = 0.02,
+    ):
+        self.init_std = init_std
+        super().__init__(in_features, out_features, bias=bias)
+
+    def _init_self_parameters(self) -> None:
+        if self.init_std == 0.0:
+            nn.init.zeros_(self.weight)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+        else:
+            _init_linear_trunc_normal(self, std=self.init_std)
+
 
 class AdversarialDetector(Module):
     """Lightweight 2-layer MLP that predicts whether the current hidden state
@@ -93,7 +120,7 @@ class AdversarialDetector(Module):
 
     Outputs a scalar probability in [0, 1] per token (higher = more likely
     adversarial).  During training this is supervised implicitly by the
-    MoralGovernor's blend gate: adversarial inputs should route more weight
+    MoralGovernor's smooth blend gate: adversarial inputs route more weight
     toward the moral-elevating blend.  Explicit labelled adversarial examples
     in the training corpus will sharpen this signal.
 
@@ -105,8 +132,16 @@ class AdversarialDetector(Module):
     def __init__(self, dim: int, hidden_dim: int | None = None):
         super().__init__()
         hidden_dim = hidden_dim or max(64, dim // 4)
-        self.fc1 = TTLinear(dim, hidden_dim, bias=False)
-        self.fc2 = TTLinear(hidden_dim, 1, bias=False)
+        self.fc1 = _InitLinear(dim, hidden_dim, bias=False, init_std=0.02)
+        # Initialize fc2 with small weights and negative bias so adversarial_prob
+        # starts near 0 at initialization rather than randomly triggering overrides
+        # on 50% of benign pretraining tokens.
+        self.fc2 = _InitLinear(hidden_dim, 1, bias=True, init_std=0.01)
+
+    def _init_self_parameters(self) -> None:
+        # Bias fc2 to -3.0 so sigmoid(-3.0) ≈ 0.047 at start of training
+        if self.fc2.bias is not None:
+            nn.init.constant_(self.fc2.bias, -3.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -133,22 +168,26 @@ class MoralGovernor(Module):
     * ``moral_score`` ∈ [0, 1] — how morally aligned the current representation is.
     * ``alpha`` ∈ [0, 1] — blend weight: ``alpha`` toward logical, ``1-alpha``
       toward generative.  When adversarial intent is detected, ``alpha`` is
-      boosted toward ``moral_override_alpha`` to dampen potential harmful
-      reasoning chains and elevate moral tone.
+      smoothly interpolated toward ``moral_override_alpha`` to dampen potential
+      harmful reasoning chains and elevate moral tone.
     * ``adversarial_prob`` ∈ [0, 1] — per-token adversarial signal.
 
     The final blended attention output is::
 
         blended = alpha * logical_out + (1 - alpha) * gen_out
 
+    Note: The routing gate (``alpha``) and ``moral_score`` use decoupled MLP
+    branches so that the moral auxiliary loss ``-mean(moral_score)`` does not
+    saturate the routing trunk during general language pretraining.
+
     Args:
         dim: Hidden dimension.
-        moral_gate_hidden: Hidden size of the moral scoring MLP (default dim//8).
+        moral_gate_hidden: Hidden size of the moral scoring & routing MLPs (default dim//8).
         moral_override_alpha: The alpha value to interpolate toward when
             adversarial intent is detected (default 0.85, heavily logical /
             deliberative to suppress creative harm).
-        adversarial_threshold: Probability above which a token is considered
-            adversarial for the override interpolation (default 0.5).
+        adversarial_threshold: Center probability for smooth sigmoid override
+            interpolation (default 0.5).
     """
 
     def __init__(
@@ -161,9 +200,14 @@ class MoralGovernor(Module):
         super().__init__()
         moral_gate_hidden = moral_gate_hidden or max(64, dim // 8)
 
-        # Two-output MLP: produces [moral_score_logit, blend_alpha_logit]
-        self.gate_fc1 = TTLinear(dim, moral_gate_hidden, bias=False)
-        self.gate_fc2 = TTLinear(moral_gate_hidden, 2, bias=False)
+        # Decoupled routing MLP (produces blend_alpha_logit) so moral aux loss
+        # cannot saturate the hemisphere routing features.
+        self.gate_fc1 = _InitLinear(dim, moral_gate_hidden, bias=False, init_std=0.02)
+        self.gate_fc2 = _InitLinear(moral_gate_hidden, 1, bias=False, init_std=0.01)
+
+        # Moral alignment scoring MLP (produces moral_score_logit)
+        self.moral_fc1 = _InitLinear(dim, moral_gate_hidden, bias=False, init_std=0.02)
+        self.moral_fc2 = _InitLinear(moral_gate_hidden, 1, bias=False, init_std=0.02)
 
         self.adversarial_detector = AdversarialDetector(dim)
         self.moral_override_alpha = moral_override_alpha
@@ -186,19 +230,29 @@ class MoralGovernor(Module):
             moral_score:      ``(batch, seq, 1)``  — per-token moral alignment in [0, 1].
             adversarial_prob: ``(batch, seq, 1)``  — per-token adversarial probability.
         """
-        # 1. Compute moral score and raw blend alpha from hidden state
-        h = F.silu(self.gate_fc1(x))               # (B, S, moral_gate_hidden)
-        gate_out = torch.sigmoid(self.gate_fc2(h))  # (B, S, 2)  values in [0, 1]
-        moral_score = gate_out[..., :1]             # (B, S, 1)
-        alpha = gate_out[..., 1:]                   # (B, S, 1)
+        # 1. Compute decoupled moral score and blend alpha from hidden state
+        h_moral = F.silu(self.moral_fc1(x))
+        moral_score = torch.sigmoid(self.moral_fc2(h_moral))  # (B, S, 1)
+
+        h_gate = F.silu(self.gate_fc1(x))
+        alpha = torch.sigmoid(self.gate_fc2(h_gate))          # (B, S, 1)
 
         # 2. Detect adversarial intent
         adversarial_prob = self.adversarial_detector(x)  # (B, S, 1)
 
-        # 3. Override blend gate when adversarial intent is detected.
-        #    We do a soft interpolation so the gradient can still flow.
-        #    override_strength ∈ [0, 1]:  0 = no override, 1 = full override.
-        override_strength = (adversarial_prob > self.adversarial_threshold).to(x.dtype)
+        # 3. Differentiable override blend gate when adversarial intent is detected.
+        #    Uses a smooth temperature-scaled sigmoid centered at adversarial_threshold
+        #    (and zero-anchored at prob=0) so gradients flow cleanly through both
+        #    alpha and adversarial_detector without clobbering benign tokens.
+        sharpness = 10.0
+        raw_override = torch.sigmoid(
+            sharpness * (adversarial_prob - self.adversarial_threshold)
+        )
+        baseline = math.sigmoid(-sharpness * self.adversarial_threshold) if hasattr(math, "sigmoid") else (1.0 / (1.0 + math.exp(sharpness * self.adversarial_threshold)))
+        override_strength = torch.clamp(
+            (raw_override - baseline) / (1.0 - baseline), min=0.0, max=1.0
+        ).to(x.dtype)
+
         # Interpolate: when adversarial, push alpha toward moral_override_alpha
         alpha = override_strength * self.moral_override_alpha + (1.0 - override_strength) * alpha
         alpha = alpha.to(x.dtype)
@@ -240,8 +294,8 @@ class CorpusCallosum(Module):
     The update equations are::
 
         g = sigmoid(gate_mlp(x))                     # (B, S, 1)
-        cal_excit = g * W_excit_up(relu(W_excit_dn(logical_out)))
-        cal_inhibit = g * W_inhib_up(relu(W_inhib_dn(gen_out)))
+        cal_excit = g * W_excit_up(silu(W_excit_dn(logical_out)))
+        cal_inhibit = g * W_inhib_up(silu(W_inhib_dn(gen_out)))
 
         gen_out'     = gen_out     + cal_excit          # excitatory
         logical_out' = logical_out - cal_inhibit        # IHI (net inhibitory)
@@ -270,16 +324,18 @@ class CorpusCallosum(Module):
         gate_hidden = config.gate_hidden or max(16, dim // 8)
 
         # Excitatory path: logical → generative (low-rank bottleneck)
-        self.excit_dn = TTLinear(dim, r, bias=False)
-        self.excit_up = TTLinear(r, dim, bias=False)
+        # Up-projections are initialized with small std (0.002) so callosal
+        # transfer starts near identity and smoothly opens during training.
+        self.excit_dn = _InitLinear(dim, r, bias=False, init_std=0.02)
+        self.excit_up = _InitLinear(r, dim, bias=False, init_std=0.002)
 
         # Inhibitory path: generative → logical (IHI, low-rank bottleneck)
-        self.inhibit_dn = TTLinear(dim, r, bias=False)
-        self.inhibit_up = TTLinear(r, dim, bias=False)
+        self.inhibit_dn = _InitLinear(dim, r, bias=False, init_std=0.02)
+        self.inhibit_up = _InitLinear(r, dim, bias=False, init_std=0.002)
 
         # Gate MLP: x → g ∈ [0, 1]  (conditioned on pre-norm hidden state)
-        self.gate_fc1 = TTLinear(dim, gate_hidden, bias=False)
-        self.gate_fc2 = TTLinear(gate_hidden, 1, bias=False)
+        self.gate_fc1 = _InitLinear(dim, gate_hidden, bias=False, init_std=0.02)
+        self.gate_fc2 = _InitLinear(gate_hidden, 1, bias=False, init_std=0.01)
 
     def forward(
         self,
@@ -300,11 +356,11 @@ class CorpusCallosum(Module):
         # Compute dynamic gate from current hidden state
         g = torch.sigmoid(self.gate_fc2(F.silu(self.gate_fc1(x))))  # (B, S, 1)
 
-        # Excitatory path: logical → generative
-        cal_excit = g * self.excit_up(F.relu(self.excit_dn(logical_out)))
+        # Excitatory path: logical → generative (use SiLU to avoid dead ReLU units)
+        cal_excit = g * self.excit_up(F.silu(self.excit_dn(logical_out)))
 
         # Inhibitory path: generative → logical (net IHI — we negate)
-        cal_inhibit = g * self.inhibit_up(F.relu(self.inhibit_dn(gen_out)))
+        cal_inhibit = g * self.inhibit_up(F.silu(self.inhibit_dn(gen_out)))
 
         logical_out_prime = (logical_out - cal_inhibit).to(logical_out.dtype)   # IHI suppresses logical
         gen_out_prime = (gen_out + cal_excit).to(gen_out.dtype)             # excitatory boosts generative
@@ -447,23 +503,25 @@ class DualHemisphereAttention(BaseAttention):
         # -------------------------------------------------------------------------------
 
         # ---- Q projections: logical hemisphere ----
+        # Always build q_norm_logical (QK-Norm on q_nope when q_lora_rank==0,
+        # or latent norm when q_lora_rank > 0) to stabilize attention logits.
+        self.q_norm_logical = config.q_norm_logical.build()
         if self.q_lora_rank == 0:
             assert config.wq_logical is not None, "wq_logical required when q_lora_rank==0"
             self.wq_logical = config.wq_logical.build()
         else:
             assert config.wq_a_logical is not None and config.wq_b_logical is not None
             self.wq_a_logical = config.wq_a_logical.build()
-            self.q_norm_logical = config.q_norm_logical.build()
             self.wq_b_logical = config.wq_b_logical.build()
 
         # ---- Q projections: generative hemisphere ----
+        self.q_norm_gen = config.q_norm_gen.build()
         if self.q_lora_rank == 0:
             assert config.wq_gen is not None, "wq_gen required when q_lora_rank==0"
             self.wq_gen = config.wq_gen.build()
         else:
             assert config.wq_a_gen is not None and config.wq_b_gen is not None
             self.wq_a_gen = config.wq_a_gen.build()
-            self.q_norm_gen = config.q_norm_gen.build()
             self.wq_b_gen = config.wq_b_gen.build()
 
         # ---- Shared KV compression ----
@@ -645,17 +703,22 @@ class DualHemisphereAttention(BaseAttention):
         # The learned log-scale starts at 0 (multiplier = 1.0) and diverges during
         # training: logical sharpens (positive → gamma-like focus),
         #           creative softens  (negative → theta-like broad sweep).
+        # Clamped to [-2.0, 2.0] to prevent runaway attention logit explosion or collapse.
         attn_log_scale = (
             self.logical_attn_log_scale if is_logical else self.gen_attn_log_scale
         )
         softmax_scale_base = (
             self.softmax_scale_logical if is_logical else self.softmax_scale_gen
         )
-        softmax_scale = softmax_scale_base * attn_log_scale.exp()
+        softmax_scale = softmax_scale_base * torch.clamp(attn_log_scale, min=-2.0, max=2.0).exp()
 
         # Q projection and RoPE
         q = self._project_q(x, bsz, seqlen, n_heads, is_logical)
         q_nope, q_pe = torch.split(q, [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if self.q_lora_rank == 0:
+            # Apply per-head Q-Norm on q_nope to match kv_norm and stabilize attention
+            q_norm = self.q_norm_logical if is_logical else self.q_norm_gen
+            q_nope = q_norm(q_nope)
         q_pe = apply_rotary_emb_single_complex(q_pe, freqs_cis, positions)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
@@ -939,10 +1002,10 @@ class EleosModel(Decoder):
         *,
         buffer_device: torch.device | None = None,
     ) -> None:
+        super().init_states(buffer_device=buffer_device)
         if self.enable_weight_tying:
             assert self.tok_embeddings is not None and self.output is not None
             self.tok_embeddings.weight = self.output.weight
-        super().init_states(buffer_device=buffer_device)
 
     def forward(
         self,
@@ -965,8 +1028,14 @@ class EleosModel(Decoder):
             logits:          ``(batch, seq, vocab_size)``
             moral_aux_loss:  scalar — only returned when ``return_moral_loss=True``.
         """
-        # Embed
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        # Embed (scale by sqrt(dim) when weights are tied so token embeddings have
+        # unit variance while output projection weights remain scaled by 1/sqrt(dim))
+        if self.tok_embeddings is not None:
+            h = self.tok_embeddings(tokens)
+            if self.enable_weight_tying:
+                h = h * math.sqrt(self.config.dim)
+        else:
+            h = tokens
 
         # Accumulate moral scores
         moral_scores: list[torch.Tensor] = []

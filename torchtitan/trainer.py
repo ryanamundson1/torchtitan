@@ -610,7 +610,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         mask_type = getattr(attn_config, "mask_type", "causal")
 
         positions = extra_inputs.pop("positions", None)
-        if mask_type == "block_causal":
+        if mask_type == "block_causal" or positions is not None:
             # Per-document positions from the dataloader
             extra_kwargs["positions"] = positions
         elif self.parallel_dims.cp_enabled:

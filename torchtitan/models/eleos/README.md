@@ -26,6 +26,7 @@ The head-split ratio between hemispheres is **configurable per layer**, defaulti
 |---|---|---|---|---|
 | `debugmodel` | 6 | 256 | 8 | Fast CI / dev iteration |
 | `debugmodel_flex_attn` | 6 | 256 | 8 | Uses FlexAttention |
+| `small` | 24 | 768 | 8 | Deep-and-thin SLM (~420M params, tied embeddings, 2 dense + 22 MoE layers) |
 | `16B` | 27 | 2048 | 64 | Dense layer 0 + 26 MoE layers |
 | `236B` | 60 | 5120 | 160 | LoRA Q projections |
 | `671B` | 61 | 7168 | 256 | LoRA Q, sigmoid router |

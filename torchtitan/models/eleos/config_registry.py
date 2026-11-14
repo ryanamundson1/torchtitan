@@ -16,7 +16,7 @@ e.g.:
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.components.quantization.float8 import (
     Float8GroupedMMConverter,
     Float8LinearConverter,
@@ -74,16 +74,37 @@ def eleos_debugmodel_flex_attn() -> Trainer.Config:
     return config
 
 
+_ELEOS_PARAM_GROUPS = [
+    # Exclude norms, biases, scalar attention scales, and token embeddings from weight decay
+    ParamGroupConfig(
+        pattern=r"(\.bias$|norm|attn_log_scale|tok_embeddings)",
+        weight_decay_multiplier=0.0,
+    ),
+]
+
+
 def eleos_small() -> Trainer.Config:
-    """Small scale training config (~370M params with tied embeddings)."""
+    """Small scale training config (~420M params, 24 layers, tied embeddings).
+
+    Uses modern SLM training best practices (SmolLM2/3, Qwen3, OLMoE):
+    - Higher peak LR (1e-3) enabled by QK-Norm and clamped attention log-scales
+    - Warmup-Stable-Decay (WSD) schedule (decay_ratio=0.2) so training stays at
+      peak learning rate for 80% of steps before cosine cooldown, allowing seamless
+      continuation across 10k-50k+ steps without premature LR starvation
+    - Zero weight decay on norms, biases, and embeddings
+    """
     return Trainer.Config(
         hf_assets_path="./assets/hf/eleos-tokenizer",
         model_spec=model_registry("small"),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="fineweb_edu"),
-        optimizer=OptimizersContainer.Config(lr=4e-4),
+        optimizer=OptimizersContainer.Config(
+            lr=1e-3,
+            weight_decay=0.1,
+            param_groups=_ELEOS_PARAM_GROUPS,
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=100,
-            decay_ratio=0.8,
+            warmup_steps=500,
+            decay_ratio=0.2,
             decay_type="cosine",
             min_lr_factor=0.1,
         ),
@@ -91,13 +112,13 @@ def eleos_small() -> Trainer.Config:
             local_batch_size=1,
             global_batch_size=32,
             seq_len=1024,
-            steps=10000,
+            steps=50000,
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
             expert_tensor_parallel_degree=1,
         ),
-        checkpoint=CheckpointManager.Config(interval=100),
+        checkpoint=CheckpointManager.Config(interval=250),
         activation_checkpoint=ActivationCheckpointConfig(
             mode="selective",
         ),

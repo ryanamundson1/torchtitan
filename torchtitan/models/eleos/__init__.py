@@ -178,8 +178,12 @@ def _make_dha_config(
         )
         wq_a_logical = wq_b_logical = None
         wq_a_gen = wq_b_gen = None
-        q_norm_logical = RMSNorm.Config(normalized_shape=1, param_init=_NORM_INIT)
-        q_norm_gen = RMSNorm.Config(normalized_shape=1, param_init=_NORM_INIT)
+        q_norm_logical = RMSNorm.Config(
+            normalized_shape=_qk_nope_log, param_init=_NORM_INIT
+        )
+        q_norm_gen = RMSNorm.Config(
+            normalized_shape=_qk_nope_gen, param_init=_NORM_INIT
+        )
     else:
         # ---- LoRA Q projections ----
         wq_logical = wq_gen = None
@@ -520,6 +524,7 @@ def _debugmodel() -> EleosModel.Config:
         num_shared_experts=2,
         router_top_k=3,
         router_score_func="softmax",
+        router_route_norm=True,
         score_before_experts=False,
         logical_head_fractions=fractions,
         logical_head_dim_scale=1.25,
@@ -579,6 +584,7 @@ def _debugmodel_flex_attn() -> EleosModel.Config:
         num_shared_experts=2,
         router_top_k=3,
         router_score_func="softmax",
+        router_route_norm=True,
         score_before_experts=False,
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
@@ -652,6 +658,7 @@ def _16b() -> EleosModel.Config:
         num_shared_experts=2,
         router_top_k=6,
         router_score_func="softmax",
+        router_route_norm=True,
         score_before_experts=False,
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
@@ -722,6 +729,7 @@ def _236b() -> EleosModel.Config:
         router_num_expert_groups=8,
         router_num_limited_groups=3,
         router_route_scale=16.0,
+        router_route_norm=True,
         score_before_experts=False,
         inner_attention=FlexAttention.Config(),
         mask_type="block_causal",
@@ -832,17 +840,32 @@ def _671b() -> EleosModel.Config:
 
 
 def _small() -> EleosModel.Config:
-    """~370M parameter model with tied weights and aligned head dims for native MPS SDPA."""
-    dim, n_layers, vocab_size = 768, 12, 102400
+    """Modern deep-and-thin SLM architecture (24 layers, dim=768) with tied weights,
+    graduated dual-hemisphere head splits, normalized MoE routing, and aligned head
+    dims (qk_head_dim == v_head_dim == 128) for native MPS / Flash SDPA.
+    """
+    dim, n_layers, vocab_size = 768, 24, 102400
     n_heads = 12
     rope_dim = 64
 
-    # Simple 50/50 split for all layers
-    fractions = [0.50] * n_layers
+    # Graduated per-layer hemisphere split (aligned with 16B/236B/671B):
+    # - Dense layers 0-1:      0.67 logical (8 logical / 4 creative heads)
+    # - Early MoE layers 2-7:  0.58 logical (7 logical / 5 creative heads)
+    # - Mid MoE layers 8-15:   0.50 balanced (6 logical / 6 creative heads)
+    # - Late MoE layers 16-21: 0.42 generative-leaning (5 logical / 7 creative heads)
+    # - Final layers 22-23:    0.33 generative (4 logical / 8 creative heads)
+    fractions = [
+        *[0.67] * 2,
+        *[0.58] * 6,
+        *[0.50] * 8,
+        *[0.42] * 6,
+        *[0.33] * 2,
+    ]
+    assert len(fractions) == n_layers
 
     layers = _build_eleos_layers(
         n_layers=n_layers,
-        n_dense_layers=1,
+        n_dense_layers=2,
         dim=dim,
         n_heads=n_heads,
         q_lora_rank=0,
@@ -853,30 +876,30 @@ def _small() -> EleosModel.Config:
         mscale=0.70,
         dense_hidden_dim=2048,
         moe_hidden_dim=512,
-        num_experts=16,
-        num_shared_experts=2,
-        router_top_k=4,
+        num_experts=8,
+        num_shared_experts=1,
+        router_top_k=2,
         router_score_func="softmax",
+        router_route_norm=True,
         score_before_experts=False,
         inner_attention=ScaledDotProductAttention.Config(),
         mask_type="causal",
         logical_head_fractions=fractions,
         logical_head_dim_scale=1.0,
         gen_head_dim_scale=1.0,
-        # Corpus callosum — 12 layers (dim=768), topographic mapping:
-        #   genu=0-1      (thin)  → prefrontal, planning
-        #   midbody=4-7   (thick) → motor/somatosensory integration
-        #   isthmus=8-9   (thin)  → auditory/temporal
-        #   splenium=10-11(thin)  → perceptual synthesis
+        # Corpus callosum — 24 layers (dim=768), topographic mapping:
+        #   genu=0-1       (thin)  → prefrontal, planning
+        #   midbody=7-14   (thick) → sensorimotor integration hub
+        #   isthmus=15-17  (thin)  → auditory/temporal
+        #   splenium=22-23 (thin)  → perceptual synthesis
         # fiber_rank_thin = 48  (dim//16, ~6% of dim — associative fibers)
-        # fiber_rank_thick = 96  (dim//8,  ~12% of dim — fast sensorimotor)
-        # gate_hidden = 24       (dim//32 — minimal gate for scalar switch)
-        # Callosal overhead ≈ 0.8% of total params at this scale
-        callosal_layers=[0, 1, 4, 5, 6, 7, 8, 9, 10, 11],
-        callosal_thick_layers=[4, 5, 6, 7],
+        # fiber_rank_thick = 96 (dim//8,  ~12% of dim — fast sensorimotor)
+        # gate_hidden = 32      (compact scalar switch)
+        callosal_layers=[0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 22, 23],
+        callosal_thick_layers=[7, 8, 9, 10, 11, 12, 13, 14],
         callosal_fiber_rank_thin=48,
         callosal_fiber_rank_thick=96,
-        callosal_gate_hidden=24,
+        callosal_gate_hidden=32,
     )
     return EleosModel.Config(
         vocab_size=vocab_size,
