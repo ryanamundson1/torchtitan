@@ -120,7 +120,7 @@ def eleos_small() -> Trainer.Config:
         ),
         checkpoint=CheckpointManager.Config(interval=250),
         activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
+            mode="full",
         ),
         compile=CompileConfig(enable=True, components=["loss"]),
     )
