@@ -56,6 +56,8 @@ class DeviceMemoryMonitor:
             device_module.reset_peak_memory_stats()
         if hasattr(device_module, "empty_cache"):
             device_module.empty_cache()
+        self._last_num_retries = 0
+        self._last_num_ooms = 0
 
     def _to_gib(self, memory_in_bytes):
         # NOTE: GiB (gibibyte) is 1024, vs GB is 1000
@@ -79,15 +81,23 @@ class DeviceMemoryMonitor:
         max_reserved_gib = self._to_gib(max_reserved)
         max_reserved_pct = self._to_pct(max_reserved)
 
-        num_retries = device_info.get("num_alloc_retries", -1)
-        num_ooms = device_info.get("num_ooms", -1)
+        num_retries = device_info.get("num_alloc_retries", 0)
+        num_ooms = device_info.get("num_ooms", 0)
+        new_retries = num_retries - self._last_num_retries
+        new_ooms = num_ooms - self._last_num_ooms
+        self._last_num_retries = num_retries
+        self._last_num_ooms = num_ooms
 
-        if num_retries > 0:
+        if new_retries > 0:
             logger.warning(
-                f"{num_retries} {device_type.upper()} memory allocation retries."
+                f"{new_retries} new {device_type.upper()} memory allocation retries "
+                f"({num_retries} total)."
             )
-        if num_ooms > 0:
-            logger.warning(f"{num_ooms} {device_type.upper()} OOM errors thrown.")
+        if new_ooms > 0:
+            logger.warning(
+                f"{new_ooms} new {device_type.upper()} OOM errors thrown "
+                f"({num_ooms} total)."
+            )
 
         return DeviceMemStats(
             max_active_gib,
